@@ -14,6 +14,7 @@ import time
 
 import torch
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 from ired.autoencoder import FrozenT5Autoencoder
@@ -37,7 +38,13 @@ def build_parser():
                    help="'full' uses the GSM8K chain-of-thought; 'final' uses only "
                         "the numeric answer. 'full' is recommended — see gensis.md §8.")
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1e-4,
+                   help="base LR after warmup. 3e-4 (old default) was too hot for "
+                        "the LD4LG-faithful pool + recon stack; collapsed to unigram.")
+    p.add_argument("--weight-decay", type=float, default=0.01,
+                   help="bounds AE param magnitudes, reduces local-minima stickiness.")
+    p.add_argument("--warmup-steps", type=int, default=1000,
+                   help="linear LR warmup from 0 to --lr over this many steps.")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=500)
@@ -127,8 +134,19 @@ def main(argv=None):
 
     pool_params = ae.trainable_parameters()
     n_params = sum(p.numel() for p in pool_params)
-    print(f"trainable pool params: {n_params:,}")
-    opt = AdamW(pool_params, lr=args.lr)
+    print(f"trainable AE params (pool + recon): {n_params:,}")
+    opt = AdamW(pool_params, lr=args.lr, weight_decay=args.weight_decay)
+
+    # Linear warmup: factor goes 0 → 1 over warmup_steps, then stays at 1.
+    def _lr_lambda(step: int) -> float:
+        if args.warmup_steps <= 0:
+            return 1.0
+        return min(1.0, float(step + 1) / float(args.warmup_steps))
+    sched = LambdaLR(opt, _lr_lambda)
+    print(
+        f"optimizer: AdamW(lr={args.lr}, wd={args.weight_decay})  "
+        f"warmup_steps={args.warmup_steps}"
+    )
 
     step = 0
     train_iter = iter(train_loader)
@@ -148,11 +166,13 @@ def main(argv=None):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(pool_params, 1.0)
         opt.step()
+        sched.step()
 
         step += 1
         if step % args.log_every == 0:
             elapsed = time.time() - t0
-            print(f"step {step:6d} | loss {loss.item():.4f} | {elapsed:.1f}s")
+            cur_lr = opt.param_groups[0]["lr"]
+            print(f"step {step:6d} | loss {loss.item():.4f} | lr {cur_lr:.2e} | {elapsed:.1f}s")
 
         if step % args.eval_every == 0 or step == args.steps:
             ev = eval_reconstruction(

@@ -11,4 +11,5 @@ wheels/
 
 
 /checkpoints/*
-trail_all.ipynb
+*.ipynb
+train_all.ipynb
