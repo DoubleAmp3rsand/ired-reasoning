@@ -26,6 +26,13 @@ def build_parser():
     p.add_argument("--k", type=int, default=32)
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
+    p.add_argument("--d-ae", type=int, default=-1,
+                   help="diffusion-space latent dimension (LD4LG d_ae). "
+                        "-1 (default) = d_model (no down-projection); "
+                        "set <d_model to shrink the EBM's diffusion space.")
+    p.add_argument("--recon-layers", type=int, default=2,
+                   help="depth of the ReconstructionNet (f_ψ)")
+    p.add_argument("--recon-heads", type=int, default=8)
     p.add_argument("--answer-mode", choices=["final", "full"], default="full",
                    help="'full' uses the GSM8K chain-of-thought; 'final' uses only "
                         "the numeric answer. 'full' is recommended — see gensis.md §8.")
@@ -89,14 +96,23 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    print(f"loading autoencoder: {args.model} (k={args.k}, pool_layers={args.pool_layers})")
+    d_ae = args.d_ae if args.d_ae > 0 else None
+    print(
+        f"loading autoencoder: {args.model} "
+        f"(k={args.k}, pool_layers={args.pool_layers}, recon_layers={args.recon_layers}, "
+        f"d_ae={'d_model' if d_ae is None else d_ae})"
+    )
     ae = FrozenT5Autoencoder(
         model_name=args.model,
         k=args.k,
         pool_layers=args.pool_layers,
         pool_heads=args.pool_heads,
+        d_ae=d_ae,
+        recon_layers=args.recon_layers,
+        recon_heads=args.recon_heads,
     ).to(args.device)
     ae.train()
+    print(f"d_model={ae.d_model}  d_ae={ae.d_ae}")
 
     train_ds = GSM8KDataset("train", answer_mode=args.answer_mode)
     test_ds = GSM8KDataset("test", answer_mode=args.answer_mode)
@@ -154,14 +170,14 @@ def main(argv=None):
                 print(f"      gold: {_snip(gold)}")
                 print(f"      pred: {_snip(pred)}")
             ckpt = {
-                "pool": ae.state_dict_pool(),
+                "ae": ae.state_dict_ae(),
                 "config": vars(args),
                 "step": step,
                 "eval_acc": ev["final_acc"],
                 "exact_acc": ev["exact_acc"],
             }
-            torch.save(ckpt, os.path.join(args.save_dir, f"pool_step{step}.pt"))
-            torch.save(ckpt, os.path.join(args.save_dir, "pool_latest.pt"))
+            torch.save(ckpt, os.path.join(args.save_dir, f"ae_step{step}.pt"))
+            torch.save(ckpt, os.path.join(args.save_dir, "ae_latest.pt"))
 
 
 if __name__ == "__main__":

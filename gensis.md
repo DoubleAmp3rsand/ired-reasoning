@@ -212,7 +212,54 @@ Why keep this as an auxiliary rather than the primary objective: as discussed in
 
 Default in this repo: `--decoder-aux-weight 0.0` (off, matches §5.1 exactly). Recommended for ablation on short-answer tasks: `--decoder-aux-weight 0.1 --decoder-aux-t-max 2`.
 
-### 7.5 Inference cost
+### 7.5 LD4LG-faithful compression / reconstruction split
+
+The original draft of this proposal collapsed LD4LG's two-network design into a single "pool" module:
+
+```
+text → E_frozen → Pool → z → D_frozen → text       (original)
+```
+
+Empirically that plateaued Milestone 1 at loss ≈ 1.45 (token p ≈ 0.23). The diagnosis: the pool was wearing two hats simultaneously and the objectives partially conflict. Switching to LD4LG's split gives each subnetwork a single job:
+
+```
+text → E_frozen → Pool (f_φ) → z ∈ R^(K×d_ae) → ReconstructionNet (f_ψ) → R^(K×d_LM) → D_frozen → text
+                                       │
+                                       ▼
+                              [diffuse here, EBM]
+```
+
+**Two distinct jobs**:
+
+1. **Compression** (`f_φ` = the pool). Maps a variable-length encoder hidden sequence to K latent slots that pack answer-relevant content densely.
+2. **Decoder compatibility** (`f_ψ` = the reconstruction network). Shapes those K slots into something the frozen T5 cross-attention can actually read. T5's decoder was trained on encoder outputs with specific statistical properties; arbitrary pool outputs aren't guaranteed to match.
+
+These objectives pull in different directions: (1) wants information density (sparse, high-entropy, unique-per-input); (2) wants statistical similarity to natural T5 encoder hidden states (smoother, more redundant, on-manifold). Separating them lets each module specialize. This is the standard "separation of concerns" win that LD4LG (after Flamingo's Perceiver Resampler) validated empirically.
+
+**Two architectural fixes inside the pool itself**:
+
+LD4LG specifies the Perceiver Resampler update as
+
+```
+Z = Z + MHA(q = Z, kv = [Z; E(w)])
+```
+
+— one MHA call per layer with keys/values being the **concatenation** of latents and encoder hidden states. Each attention head can dynamically allocate its budget between latent-latent mixing and encoder-extraction. The naïve `nn.TransformerDecoderLayer` substitute does two separate MHAs (self-attn over latents, then cross-attn to encoder), which forces every head into one role. Same parameter count, different inductive bias; the LD4LG-faithful combined-MHA version is what we use. See §11.6 for the failure mode of the separated variant.
+
+The pool also ends with a learnable linear projection `d_LM → d_ae` (no-op when `d_ae = d_LM`). This is the dimensionality knob — when the AE has converged, dropping `d_ae` shrinks the EBM's diffusion space by the same factor and is the most impactful lever for Milestone 2 tractability.
+
+**Two-step rollout**:
+
+We attempt these as separate steps so we can attribute which fix is doing the work.
+
+- **Step 1 (default).** `d_ae = d_model = 768`. Adds the recon net and the combined-MHA pool without changing latent dimensionality. This isolates the "dual-role pool was the bottleneck" hypothesis. Diagnostic: does Milestone 1's final-answer extraction accuracy clear the 90% bar that the single-pool design plateaued well below?
+- **Step 2.** Drop `d_ae` to ~128 once Step 1 is verified. Shrinks the EBM diffusion space by ~6× — the structural fix for "the EBM has too many DoF to denoise into" that §7.4 motivated for short answers. Step 2 changes the EBM input shape, so M2 must be retrained.
+
+**Trainable parameter cost**: Step 1 adds ~9M (the 2-layer ReconstructionNet at `d=768`), bringing the default AE from 18.9M → 28.4M trainable. Step 2 is parameter-neutral relative to Step 1 (the dimensionality projection is a single linear layer).
+
+**Risk**: the bootstrap cost. With f_ψ at random init, the very first decode is *worse* than the single-pool version was at random init (one more random module in the path). At step 0 of Milestone 1 we observed `decode_loss ≈ 13.0` vs the pool-only random-init baseline of ~10.4. The model has to learn through this initial deficit. If you see eval loss still above 10 after a few hundred steps, that's pathological — but if it drops below 5 within the first eval cycle, you're on track.
+
+### 7.6 Inference cost
 
 Each inner step is one forward+backward through the energy network. For an IRED schedule with `T=10` outer × `N=5` inner = 50 transformer passes through the energy net, versus ~200 AR tokens of CoT through the full LLM. FLOPs-comparable if the energy net is ~1/4 the size of the decoder.
 
@@ -234,6 +281,8 @@ Realistic single-GPU prototype to validate the core thesis.
 
 **Practical defaults that survived first-run debugging (see §11):**
 - **Model size:** `flan-t5-base` (d_model=768) for faster iteration. `large` is a drop-in.
+- **Autoencoder architecture:** LD4LG-faithful — `AttentionPool` (Perceiver Resampler with combined `MHA(q=Z, kv=[Z;E(w)])`) + explicit `ReconstructionNet` (f_ψ). See §7.5 for the rationale and §11.6 for what goes wrong without the combined MHA. Default `d_ae = d_model`; set lower (Step 2) once Milestone 1 is converged to shrink the EBM's diffusion space.
+- **Pool/recon capacity:** `K=64, pool_layers=4, recon_layers=2` (~37M trainable AE params at d_model=768). The K=32 / 2-layer-pool / no-recon design plateaued at loss ~1.45.
 - **Answer mode:** `full` (the CoT ending in `#### N`), not `final` (just the number). With `K=32, d=768` the latent has ~24k DoF; a final-only answer carries ~60 bits, leaving the data manifold ~5 orders of magnitude smaller than the latent volume. The EBM can find the rough direction but can't precisely localize, and head magnitude inflates trying to compensate. Full mode also gives reasoning structure to denoise toward. Eval extracts `#### N` from decoded text rather than byte-exact matching.
 - **`max_a_length`:** `256` for full mode. Covers ~99% of GSM8K answers (p99=240, max=354). `128` (the previous default) truncates ~25% of the training set.
 - **β schedule:** `cosine`, not `linear`. Linear at T=10 saturates immediately after clamping (β=0.999 for 5 of 10 steps), giving the EBM almost no useful t spread.
@@ -633,6 +682,35 @@ with sdpa_kernel([SDPBackend.MATH]):
 ```
 
 This costs throughput vs flash attention, but is the only kernel that supports double-backward. A nicer long-term solution is to switch the EBM to a custom transformer that uses an explicit attention implementation, but the kernel switch is the smallest fix.
+
+---
+
+### 11.6 `nn.TransformerDecoderLayer` is not a Perceiver Resampler
+
+When implementing LD4LG's compression network, the obvious shortcut is to use PyTorch's `nn.TransformerDecoderLayer` as the per-layer building block — it already does cross-attention from a target sequence to a memory sequence, which superficially matches "K latent queries attending to encoder hidden states." We did this initially and Milestone 1 plateaued at loss ≈ 1.45 (token p ≈ 0.23).
+
+The deviation: `nn.TransformerDecoderLayer` does **two separate** MHA calls per layer:
+
+```
+x = x + self_attn(x, x, x)                # latent → latent only
+x = x + cross_attn(x, memory, memory)     # latent → encoder only
+x = x + ff(x)
+```
+
+LD4LG / Perceiver Resampler / Flamingo specifies **one combined** MHA per layer:
+
+```
+Z = Z + MHA(q = Z, kv = [Z; E(w)])        # each head decides its own latent↔encoder split
+Z = Z + FF(Z)
+```
+
+Same parameter count, materially different inductive bias. In the separated form, every attention head is forced into exactly one role — extract-from-encoder *or* mix-with-other-latents — and the role is fixed at architecture time. In the combined form, each head sees `K + L` positions in its KV set and can dynamically split its softmax mass between them. For a compression task with shallow stacks (we used 2 layers initially), this matters: the combined form gives the model more flexibility to specialize heads on demand.
+
+**Fix:** custom `PerceiverResamplerLayer` that concatenates `[Z; E(w)]` and does one MHA call per layer. ~30 lines. Drops in transparently because input/output shapes are unchanged.
+
+**Diagnostic:** if Milestone 1 plateaus at a loss that's significantly above `log(vocab) / 5` ≈ 2 — i.e. the model has learned *some* structure but not enough — and the per-K-position attention patterns look "monolithic" (every head doing the same thing), suspect the separated-attention form.
+
+**Lesson:** when a paper's architecture is described as a single formula, that's usually a signal. Two separate MHA calls would be `Z = Z + SA(Z); Z = Z + CA(Z, E)` — they wrote it as one for a reason. Don't substitute "close enough" library primitives without auditing the attention pattern.
 
 ---
 

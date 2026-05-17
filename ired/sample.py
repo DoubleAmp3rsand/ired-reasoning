@@ -27,6 +27,10 @@ def build_parser():
     p.add_argument("--k", type=int, default=32)
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
+    p.add_argument("--d-ae", type=int, default=-1,
+                   help="diffusion-space latent dim. Must match AE and EBM checkpoints.")
+    p.add_argument("--recon-layers", type=int, default=2)
+    p.add_argument("--recon-heads", type=int, default=8)
     p.add_argument("--ebm-layers", type=int, default=4)
     p.add_argument("--ebm-heads", type=int, default=8)
     p.add_argument("--ebm-ff-mult", type=int, default=4)
@@ -65,17 +69,27 @@ def sample_accuracy(ae, diffusion, loader, device, max_q_length, max_a_length, i
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
+    d_ae = args.d_ae if args.d_ae > 0 else None
     ae = FrozenT5Autoencoder(
         model_name=args.model,
         k=args.k,
         pool_layers=args.pool_layers,
         pool_heads=args.pool_heads,
+        d_ae=d_ae,
+        recon_layers=args.recon_layers,
+        recon_heads=args.recon_heads,
     ).to(args.device)
-    ae.load_pool(torch.load(args.ae_ckpt, map_location=args.device)["pool"])
+    ae_ckpt = torch.load(args.ae_ckpt, map_location=args.device)
+    if "ae" in ae_ckpt:
+        ae.load_ae(ae_ckpt["ae"])
+    else:
+        raise RuntimeError(
+            f"checkpoint {args.ae_ckpt} predates the LD4LG split (no 'ae' key)."
+        )
     ae.eval()
 
     ebm = EnergyTransformer(
-        d_model=ae.d_model,
+        d_model=ae.d_ae,
         k=args.k,
         n_layers=args.ebm_layers,
         n_heads=args.ebm_heads,
@@ -87,7 +101,7 @@ def main(argv=None):
     wrapper = DiffusionWrapper(ebm).to(args.device)
     diffusion = GaussianLatentDiffusion(
         model=wrapper,
-        latent_shape=(args.k, ae.d_model),
+        latent_shape=(args.k, ae.d_ae),
         timesteps=args.timesteps,
         x_start_clamp=args.x_start_clamp if args.x_start_clamp > 0 else None,
         envelope_sf=args.envelope_sf if args.envelope_sf > 0 else None,

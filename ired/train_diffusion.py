@@ -32,10 +32,14 @@ def build_parser():
     p = argparse.ArgumentParser(description="Train IRED energy network in latent space")
     # autoencoder
     p.add_argument("--model", default="google/flan-t5-base")
-    p.add_argument("--ae-ckpt", required=True, help="pool checkpoint from train_autoencoder")
+    p.add_argument("--ae-ckpt", required=True, help="AE checkpoint from train_autoencoder")
     p.add_argument("--k", type=int, default=32)
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
+    p.add_argument("--d-ae", type=int, default=-1,
+                   help="diffusion-space latent dim. Must match the AE checkpoint.")
+    p.add_argument("--recon-layers", type=int, default=2)
+    p.add_argument("--recon-heads", type=int, default=8)
     # ebm
     p.add_argument("--ebm-layers", type=int, default=4)
     p.add_argument("--ebm-heads", type=int, default=8)
@@ -158,23 +162,37 @@ def main(argv=None):
 
     # autoencoder
     print(f"loading autoencoder: {args.model}")
+    d_ae = args.d_ae if args.d_ae > 0 else None
     ae = FrozenT5Autoencoder(
         model_name=args.model,
         k=args.k,
         pool_layers=args.pool_layers,
         pool_heads=args.pool_heads,
+        d_ae=d_ae,
+        recon_layers=args.recon_layers,
+        recon_heads=args.recon_heads,
     ).to(args.device)
     ckpt = torch.load(args.ae_ckpt, map_location=args.device)
-    ae.load_pool(ckpt["pool"])
+    # Support both new format (ckpt["ae"]) and legacy (ckpt["pool"]).
+    if "ae" in ckpt:
+        ae.load_ae(ckpt["ae"])
+    else:
+        raise RuntimeError(
+            f"checkpoint {args.ae_ckpt} predates the LD4LG split (no 'ae' key). "
+            "Retrain the autoencoder with the new architecture before training the EBM."
+        )
     ae.eval()
     for p in ae.parameters():
         p.requires_grad_(False)
-    print(f"autoencoder loaded (pool eval acc at ckpt: {ckpt.get('eval_acc', 'unknown')})")
+    print(
+        f"autoencoder loaded (eval acc at ckpt: {ckpt.get('eval_acc', 'unknown')})  "
+        f"d_model={ae.d_model}  d_ae={ae.d_ae}"
+    )
 
-    # ebm
-    d_model = ae.d_model
+    # ebm — diffuses in d_ae space
+    d_diff = ae.d_ae
     ebm = EnergyTransformer(
-        d_model=d_model,
+        d_model=d_diff,
         k=args.k,
         n_layers=args.ebm_layers,
         n_heads=args.ebm_heads,
@@ -184,7 +202,7 @@ def main(argv=None):
 
     diffusion = GaussianLatentDiffusion(
         model=wrapper,
-        latent_shape=(args.k, d_model),
+        latent_shape=(args.k, d_diff),
         timesteps=args.timesteps,
         beta_schedule=args.beta_schedule,
         opt_step_size=args.opt_step_size,
@@ -208,7 +226,7 @@ def main(argv=None):
         print(f"decoder-aux enabled: weight={args.decoder_aux_weight} t_max={args.decoder_aux_t_max}")
 
     n_params = sum(p.numel() for p in ebm.parameters())
-    print(f"ebm params: {n_params:,}  (d_model={d_model}, layers={args.ebm_layers})")
+    print(f"ebm params: {n_params:,}  (diffuses in d_ae={d_diff}, layers={args.ebm_layers})")
 
     # data
     train_ds = GSM8KDataset("train", answer_mode=args.answer_mode)
