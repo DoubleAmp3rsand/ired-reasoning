@@ -148,8 +148,19 @@ class ReconstructionNet(nn.Module):
 
     Decouples 'shape latents for the frozen decoder' from the pool's
     compression job. Self-attention transformer over the K latents, with an
-    up-projection if `d_ae < d_LM`. The pre-decoder LayerNorm is what the
-    frozen T5 cross-attention will read.
+    up-projection if `d_ae < d_LM`.
+
+    **Identity-init.** Each transformer block's residual paths (attention
+    out_proj and FF linear2) are zero-initialized so the block is exactly
+    `x = x + 0 = x` at step 0. This keeps the input-conditional signal from
+    the pool intact at random init — otherwise the recon's random noise
+    swamps it and the frozen decoder falls back to unigram statistics. The
+    optimizer then gradually grows non-zero residuals as training proceeds.
+
+    **No final LayerNorm.** The frozen T5 decoder was trained on RMSNorm'd
+    encoder hidden states; adding a third LayerNorm on top (pool's final LN
+    + recon's internal LNs already happened) over-normalizes and squashes
+    the magnitude information the decoder cross-attention needs.
     """
 
     def __init__(
@@ -174,12 +185,25 @@ class ReconstructionNet(nn.Module):
             activation="gelu",
         )
         self.layers = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(d_LM)
+        # No trailing LayerNorm — see class docstring.
+
+        self._identity_init()
+
+    def _identity_init(self) -> None:
+        """Zero the residual paths of every transformer block so each block
+        is bit-exactly identity at step 0. The optimizer learns them from
+        zero, which avoids the recon's random noise drowning the pool's
+        input-conditional signal."""
+        for layer in self.layers.layers:
+            nn.init.zeros_(layer.self_attn.out_proj.weight)
+            nn.init.zeros_(layer.self_attn.out_proj.bias)
+            nn.init.zeros_(layer.linear2.weight)
+            nn.init.zeros_(layer.linear2.bias)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         x = self.up_proj(z)
         x = self.layers(x)
-        return self.norm(x)
+        return x
 
 
 class FrozenT5Autoencoder(nn.Module):
@@ -203,6 +227,7 @@ class FrozenT5Autoencoder(nn.Module):
         d_ae: int | None = None,
         recon_layers: int = 2,
         recon_heads: int = 8,
+        use_recon: bool = True,
     ):
         super().__init__()
         self.model_name = model_name
@@ -211,6 +236,7 @@ class FrozenT5Autoencoder(nn.Module):
         self.d_model = self.t5.config.d_model
         self.d_ae = d_ae if d_ae is not None else self.d_model
         self.k = k
+        self.use_recon = use_recon
 
         self.pool = AttentionPool(
             d_model=self.d_model,
@@ -219,12 +245,23 @@ class FrozenT5Autoencoder(nn.Module):
             n_layers=pool_layers,
             d_ae=self.d_ae,
         )
-        self.recon = ReconstructionNet(
-            d_ae=self.d_ae,
-            d_LM=self.d_model,
-            n_layers=recon_layers,
-            n_heads=recon_heads,
-        )
+        if self.use_recon:
+            self.recon: nn.Module = ReconstructionNet(
+                d_ae=self.d_ae,
+                d_LM=self.d_model,
+                n_layers=recon_layers,
+                n_heads=recon_heads,
+            )
+        else:
+            # Diagnostic fallback: pool output goes straight to T5 decoder. Only
+            # valid when d_ae == d_model (decoder needs d_LM-shaped input).
+            if self.d_ae != self.d_model:
+                raise ValueError(
+                    f"use_recon=False requires d_ae == d_model "
+                    f"(got d_ae={self.d_ae}, d_model={self.d_model}). "
+                    "Without recon there's no up-projection back to d_model."
+                )
+            self.recon = nn.Identity()
 
         self.freeze_t5()
 
@@ -340,15 +377,20 @@ class FrozenT5Autoencoder(nn.Module):
     # checkpoint helpers
     # ------------------------------------------------------------------
     def trainable_parameters(self):
-        return list(self.pool.parameters()) + list(self.recon.parameters())
+        params = list(self.pool.parameters())
+        if self.use_recon:
+            params += list(self.recon.parameters())
+        return params
 
     def state_dict_ae(self) -> dict:
-        """Save format: {pool, recon, d_ae}. Both modules go together because
-        they were trained jointly and only make sense as a pair."""
+        """Save format: {pool, recon, d_ae, use_recon}. Both modules go
+        together because they were trained jointly and only make sense as
+        a pair. When use_recon=False, the recon entry is None."""
         return {
-            "pool":  self.pool.state_dict(),
-            "recon": self.recon.state_dict(),
-            "d_ae":  self.d_ae,
+            "pool":      self.pool.state_dict(),
+            "recon":     self.recon.state_dict() if self.use_recon else None,
+            "d_ae":      self.d_ae,
+            "use_recon": self.use_recon,
         }
 
     def load_ae(self, state_dict: dict) -> None:
@@ -358,5 +400,12 @@ class FrozenT5Autoencoder(nn.Module):
                 f"checkpoint has d_ae={saved_d_ae} but this AE was built with "
                 f"d_ae={self.d_ae}. Construct with matching d_ae and retry."
             )
+        saved_use_recon = state_dict.get("use_recon", True)
+        if saved_use_recon != self.use_recon:
+            raise ValueError(
+                f"checkpoint has use_recon={saved_use_recon} but this AE was "
+                f"built with use_recon={self.use_recon}. Construct to match."
+            )
         self.pool.load_state_dict(state_dict["pool"])
-        self.recon.load_state_dict(state_dict["recon"])
+        if self.use_recon:
+            self.recon.load_state_dict(state_dict["recon"])
