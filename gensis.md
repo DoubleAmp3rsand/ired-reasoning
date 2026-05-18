@@ -1,18 +1,88 @@
-# IRED for LLM Reasoning: Latent Diffusion as a Thinking Module
+# LLM Reasoning via IRED — Inspired by *A Path Towards Autonomous Machine Intelligence*
 
-A proposal for applying the IRED (Iterative Reasoning through Energy Diffusion) framework to language model reasoning, by treating "thinking" as a continuous latent diffusion process between a frozen encoder and a frozen decoder.
+This proposal is a concrete instantiation of Yann LeCun's Mode-1 / Mode-2 framework from *A Path Towards Autonomous Machine Intelligence* (APTAMI), applied to language reasoning. It combines two existing pieces of work:
+
+1. **IRED** — *Iterative Reasoning through Energy Diffusion* (Du et al., ICML 2024). Provides the Mode-2 optimizer: an energy-based diffusion model whose scalar energy is calibrated to be a quality proxy, with inner-loop bad-step rejection.
+2. **LD4LG** — *Latent Diffusion for Language Generation* (Lovelace et al., NeurIPS 2023). Provides the frozen-autoencoder bottleneck: a pretrained text encoder/decoder pair with diffusion operating purely in their latent space.
+
+The result is a system that forgoes the generative nature of a traditional language model and treats "thinking" as a continuous latent diffusion process between a frozen encoder and a frozen decoder. Reasoning is gradient descent on a learned energy, not token sampling; surface form is rendered exactly once, after the latent has converged.
 
 ---
 
 ## 1. Motivation
 
-Modern "thinking" LLMs (o1, R1, QwQ, etc.) implement reasoning as **autoregressive chain-of-thought**: each reasoning token is sampled left-to-right and cannot be revisited within a single forward pass. This couples three concerns into one process:
+### 1.1 Mode-1 and Mode-2 in *A Path Towards Autonomous Machine Intelligence*
 
-1. *Deciding* what to think.
-2. *Refining* that thought.
-3. *Verbalizing* it as tokens.
+LeCun's framework separates a fast reactive policy from a slow deliberative planner:
 
-We want to separate these. IRED already gives us a principled separation for continuous problems: an energy landscape over candidate answers, with gradient-based iterative refinement and bad-step rejection. The question is whether the same machinery can drive **the thinking step itself** in a language model.
+**Mode-1 — Reactive agent (inference):**
+```
+Enc(X) → S[0] → Actor(S[0]) → A[0] → return
+```
+Mode-1 produces an action directly from the perceived state with no trajectory search.
+
+**Mode-2 — Planning agent (inference):**
+```
+Enc(X) → S[0] → Pred(S[0], A[0]) → S[1] → ... → optimal path → return A[0]
+                              ↳ A[0] → ...
+```
+Mode-2 unrolls a world model `Pred(S, A)` under an action proposal `A` and searches for the `A[0]` that minimizes a cost `Cost(S)` over the rollout. Crucially, Mode-2 is **constraint satisfaction**, not sampling: an action is chosen because it minimizes an explicit cost, not because it has high likelihood under some learned generative distribution.
+
+**Combining Mode-1 and Mode-2:**
+```
+argmin_A  D(Actor(S), A)   s.t.   Cost(Pred(S, A)) is minimized
+```
+The Mode-1 actor is distilled to imitate Mode-2's optimum, so deployment can fall back to a single forward pass.
+
+
+### 1.1a Translating the framework to language modeling
+
+The cleanest mapping from LeCun's Mode-2 onto current LLM practice is this: **chain-of-thought (CoT) is Mode-2 carried out in token space**. When an LLM emits intermediate reasoning tokens before its final answer, it is not really "thinking out loud" — it is searching for a token prefix whose conditioning yields a better final-answer distribution. Each emitted token plays the role of an action `a[t]`, the resulting prefix is the new state `s[t+1]`, and the implicit cost being minimized is roughly the negative log-likelihood of the gold answer given the prefix. RL-trained reasoners (o1, R1) make this almost literal: the reward shapes which prefixes the policy prefers, which is the cost-function role in LeCun's diagram.
+
+Token-space Mode-2 works, but it inherits three properties of the substrate that are accidents of the medium rather than features of reasoning:
+
+1. **The search space is discrete and combinatorial.** There is no useful gradient with respect to an action; refinement happens via sampling and rerolling.
+2. **The world model and the actor are the same network**, both rolled out autoregressively. There is no clean separation between *predicting the consequence of a step* and *proposing the next step* — the Pred / Actor split that LeCun's diagram relies on collapses.
+3. **The cost is implicit.** Whatever quality signal exists is baked into the policy by pretraining and RL. You cannot point at it, evaluate it on an off-policy candidate, or use it as a verifier.
+
+The question this proposal asks — and that motivates everything that follows — is whether the same search can be carried out in a continuous latent space, where each of those three properties flips: gradient descent replaces sampling, the energy net is structurally distinct from the renderer, and the cost becomes an explicit scalar that doubles as a verifier. The rest of §1 argues that energy-based diffusion is precisely the construction that makes this flip possible.
+
+### 1.2 Latent reasoning today is *latent-guided prompting*, not Mode-2
+
+Recent "latent reasoning" work — Coconut, LaDiR, Soft Thinking — runs computation in continuous space but then hands the result to an autoregressive LLM that does the actual reasoning during decoding. On close inspection these systems are **latent-guided prompting**: the latent serves as rich conditioning, and the decoder inherits whatever cognitive capacity the underlying LLM has. They are not faithful to LeCun's formulation because (a) inference is generative sampling, not optimization against a cost, and (b) the decoder is doing reasoning, not transduction.
+
+A faithful Mode-2 system in latent space needs three structural commitments:
+1. **Inference is optimization against an explicit cost**, not sampling from a learned distribution over "what reasoning looks like."
+2. **The cost signal is structurally anchored** so it resists being gamed (LeCun's hand-specified Intrinsic Cost serves this role for embodied agents; a language reasoner has to substitute something).
+3. **The decoder transduces, it does not reason** — the analogue of LeCun's actuator boundary. The full cognitive burden lives in the latent optimization.
+
+### 1.3 Why energy-based diffusion is the right substrate
+
+A diffusion model trained by score matching learns `∇log p(x) = −∇E(x)` for an implicit energy `E(x) = −log p(x)`; reverse diffusion *is* iterative gradient descent on that energy. So a trained diffusion model already defines a cost function whose gradient field is anchored in its training data and whose minima sit on the data manifold.
+
+IRED (Du et al., ICML 2024) makes this explicit. The energy `E` is no longer implicit — it is learned to be a *calibrated scalar proxy for answer quality* via an NCE term (`E(clean) < E(noisy)`) and exploited at inference via bad-step rejection (each refinement step is accepted only if `E` decreased). This is, to our knowledge, the cleanest existing instantiation of LeCun-style Mode-2 in continuous space. It has not been scaled to language.
+
+This proposal scales it: keep IRED's energy-diffusion core as the Mode-2 optimizer, isolate it between a frozen encoder and a frozen decoder so that no reasoning leaks into surface-form generation, and use the encoder of the answer text — `LatentEnc(A)` — as the structural anchor for the cost. The result satisfies, by construction, the three commitments of §1.2.
+
+### 1.4 Closing the loop: training a Mode-1 actor by distillation
+
+Because the inner loop of the energy diffusion model produces not just a denoising vector but a full **energy trajectory** — a sequence of refinements `z_T → z_{T−1} → ... → z_0` that each provably decrease `E` (bad-step rejection guarantees this) — that trajectory is a supervision signal in its own right. I can faithfully implement a separate model `Actor(X) → z*` by distilling the slow-acting energy diffusion model into a single forward pass.
+
+Concretely, once the diffusion model is trained, we collect pairs `(z_q, z_final)` where `z_q = LatentEnc(Q)` and `z_final = p_sample_loop(z_q)` is the latent the IRED outer-and-inner loop converges to. A small feed-forward (or single-pass denoising) network is then trained to regress `z_final` directly from `z_q`:
+
+```
+argmin_θ   E_Q [ || Actor_θ(z_q) − z_final ||² ]
+         where z_final = argmin_z E(z_q, z, t=0)  (obtained by the trained Mode-2 optimizer)
+```
+
+This realizes LeCun's combined Mode-1/Mode-2 objective from §1.1: the fast actor is trained to imitate the slow optimum, and deployment can fall back to a single forward pass once the imitation is faithful enough.
+
+Two reasons this matters here, beyond the generic LeCun framing:
+
+- **Deployment economics.** Mode-2 inference costs `T × N_inner` energy-network passes per query (50 by default; see §7.6). Mode-1 inference costs one. After distillation the system defaults to Mode-1 and only invokes Mode-2 on hard inputs — and we get a natural difficulty signal for free, since the trained EBM doubles as a confidence scorer: `E(z_q, Actor(z_q), 0)` is exactly the calibrated quality scalar §2 calls out. High energy → escalate to Mode-2, re-run the inner loop, and (optionally) add the resulting `(z_q, z_final)` pair to the actor's training buffer.
+- **A structurally clean distillation target that AR-CoT lacks.** Distilling token-CoT into a non-CoT model means compressing a variable-length token sequence into a shorter one — fundamentally an autoregressive-to-autoregressive problem with no closed-form notion of "the optimum to imitate." Here the source is a fixed-shape latent `z_q` and the target is a fixed-shape latent `z_final`. The actor only has to learn a fixed-input-fixed-output regression, which is among the best-behaved learning problems available.
+
+Out of scope for the §9 first experiment, which validates the Mode-2 optimizer in isolation. Mode-1 distillation is the natural follow-up once Milestone 3 (the test-time compute curve) is in hand, and is also where the §1.2 commitments earn their keep at deployment time: the Mode-2 path is the cost-anchored optimizer that *defines* what "correct" means in latent space; the Mode-1 path is the fast approximation that inherits its guarantees, with the EBM still available as a fallback verifier.
 
 ---
 
@@ -41,15 +111,15 @@ Replace surface-form reasoning with a three-stage pipeline:
 
 ```
             ┌────────────┐      ┌────────────────────┐      ┌────────────┐
-   X  ────▶│  Encoder   │─────▶│  Latent Thinking   │────▶│  Decoder   │─────▶ Result
+   X  ────▶│  LatentEnc  │────▶│  Latent Thinking   │────▶│  LatentDec  │─────▶ Result
             │  (frozen)  │  z_q │   (IRED in latent  │  z_0 │  (frozen)  │   A
             └────────────┘      │       space)       │      └────────────┘
                                 └────────────────────┘
 ```
 
-- **Encoder** maps a question `Q` to a conditioning latent `z_q`.
+- **LatentEnc** maps a question `Q` to a conditioning latent `z_q`.
 - **Latent Thinking Model** is the IRED energy network. It denoises a candidate latent `z` toward a target latent `z*` conditioned on `z_q`, iteratively, with bad-step rejection.
-- **Decoder** maps the final latent `z_0` directly to the answer `A`. No autoregressive conditioning on the latent — the latent *is* the answer's compressed representation.
+- **LatentDec** maps the final latent `z_0` directly to the answer `A`. No autoregressive conditioning on the latent — the latent *is* the answer's compressed representation.
 
 Crucially, **encoder and decoder are frozen**. Only the thinking model is trained.
 
@@ -58,20 +128,28 @@ Crucially, **encoder and decoder are frozen**. Only the thinking model is traine
 Earlier discussion flagged that LLM reasoning has no canonical clean latent: many reasoning paths produce the same answer. This proposal sidesteps the problem entirely:
 
 ```
-z_a*  =  Encoder(A)        ← deterministic, defined by the frozen encoder
+z_a*  =  LatentEnc(A)        ← deterministic, defined by the frozen encoder
 ```
 
-The answer text gives a unique target latent. The diffusion model is trained to denoise toward `Encoder(A)` given `Encoder(Q)`. Standard IRED loss applies directly.
+The answer text gives a unique target latent. The diffusion model is trained to denoise toward `LatentEnc(A)` given `LatentEnc(Q)`. Standard IRED loss applies directly.
 
-### 3.2 Why this is "real thinking" vs. Coconut-style latent CoT
+### 3.2 Why this is true Mode-2 vs. latent-guided prompting
 
-Coconut and similar work still use the LLM as an *autoregressive token generator conditioned on continuous thoughts*. The thinking is fused with surface-form production. In the proposal above:
+Coconut, LaDiR, and similar approaches still use the LLM as an *autoregressive token generator conditioned on continuous thoughts*. Reasoning is fused with surface-form production: the latent conditions an AR decoder that does substantial cognitive work during generation. By the three criteria in §1.2, these systems fail (1) — inference is sampling, not optimization — and fail (3) — the decoder reasons.
 
-- **Thinking is isolated** in a continuous latent space with smooth gradients.
-- **Surface form is isolated** in the frozen decoder.
-- The two phases do not interfere — inner-loop compute can be spent freely on thinking without touching the decoder.
+The proposal above satisfies all three by construction:
 
-This is a more honest "reasoning model": the computation that decides *what* the answer is happens before any token is emitted, and uses gradient descent rather than token sampling.
+- **Inference is optimization** (commitment 1): reverse diffusion with bad-step rejection is explicit gradient descent on a learned energy, not sampling from a generative model.
+- **The cost is anchored** (commitment 2): the target latent `LatentEnc(A)` is fixed by the frozen encoder applied to ground-truth answers. The NCE term that calibrates `E` is anchored to this same fixed point. There is no learnable target the optimizer can drift toward.
+- **The decoder transduces** (commitment 3): it sees a single latent and produces tokens. Inner-loop compute can be spent freely on thinking without touching the decoder; the boundary between cognition and surface form is sharp, in the same sense LeCun's actuator boundary is sharp.
+
+The computation that decides *what* the answer is happens entirely before any token is emitted, and it happens via gradient descent rather than token sampling. This is the structural property that distinguishes the proposal from current latent-CoT work, regardless of how it ranks empirically.
+
+### 3.3 The cost-anchoring simplification
+
+A fuller treatment of commitment (2) would use a **composite anchored cost** combining multiple structurally-different signals — e.g. world-model coherence, decoded-output stability under latent perturbation, capacity bottleneck, target-encoder distance, and external verifier where available — so that gaming the cost requires fooling several independent anchors simultaneously. That program is what the broader research direction calls for, and it is the natural place to extend this prototype once the core pipeline is working.
+
+For this first experiment we deliberately collapse that composite cost to its single most-load-bearing term: the target-encoder distance, realized as IRED's denoising MSE plus NCE against `LatentEnc(A)`. The §7.4 frozen-decoder CE auxiliary is a small step toward the composite form — it adds a second anchor (the decoder's CE against the gold tokens) and demonstrates that additional terms can be folded in without disturbing the bad-step-rejection contract. Anything richer is deferred until the single-anchor version is shown to train.
 
 ---
 
@@ -84,7 +162,7 @@ This architecture is Stable Diffusion's recipe transplanted to text reasoning:
 | VAE encoder (image → latent) | Text encoder (`Q`, `A` → latent) |
 | UNet diffusion in latent space | IRED energy net in latent space |
 | VAE decoder (latent → image) | Text decoder (latent → answer) |
-| Conditioning: CLIP text embedding | Conditioning: `z_q = Encoder(Q)` |
+| Conditioning: CLIP text embedding | Conditioning: `z_q = LatentEnc(Q)` |
 | Forward process: Gaussian noise | Forward process: Gaussian noise |
 | Reverse: noise prediction | Reverse: `ε̂ = ∇_z E` with bad-step rejection |
 
@@ -98,8 +176,8 @@ The elegance: factor the hard problem (modeling discrete text) into the **frozen
 
 ```python
 # Inputs
-z_q  = Encoder(Q)                          # conditioning
-z_a  = Encoder(A)                          # clean target
+z_q  = LatentEnc(Q)                          # conditioning
+z_a  = LatentEnc(A)                          # clean target
 
 # Forward diffusion at random timestep t
 t    = uniform(0, T)
@@ -124,7 +202,7 @@ This is *exactly* the IRED training loop from `diffusion_lib/denoising_diffusion
 ### 5.2 Inference
 
 ```python
-z_q = Encoder(Q)
+z_q = LatentEnc(Q)
 z   = randn(latent_shape)
 for t in reversed(range(T)):
     for _ in range(N_inner):
@@ -133,10 +211,59 @@ for t in reversed(range(T)):
         z_new    = z - step_size * eps_hat
         E_after  = EnergyNet(z_q, z_new, t)
         z = where(E_after < E_before, z_new, z)         # bad-step rejection
-A = Decoder(z)
+A = LatentDec(z)
 ```
 
 Test-time compute scales with `N_inner` and `T`. The decoder is invoked exactly once.
+
+### 5.3 Training the Mode-1 actor (post-hoc distillation)
+
+After the Mode-2 EBM has converged, train a one-shot actor `Actor_θ(z_q) → z*` against the converged optimizer's outputs. The encoder, decoder, and EBM are all frozen at this stage; only `Actor_θ` is updated.
+
+```python
+# All three of these are frozen during actor training
+LatentEnc, LatentDec, EnergyNet = load_pretrained(...)
+
+for Q, A in dataloader:                        # A is unused at train time;
+    z_q = LatentEnc(Q)                           # only z_q drives the actor
+
+    # Teacher rollout: run the trained Mode-2 optimizer to convergence
+    with torch.no_grad():
+        z_final = p_sample_loop(EnergyNet, z_q,        # exactly §5.2
+                                T=T, N_inner=N_inner)
+
+    # Student: one-shot regression onto the teacher's converged latent
+    z_hat   = Actor_theta(z_q)
+    L_act   = mse(z_hat, z_final)              # fixed-shape → fixed-shape
+    L_act.backward()
+```
+
+Notes:
+
+- **No backprop through the teacher.** `p_sample_loop` is run under `no_grad`; `z_final` is a fixed regression target. This is what makes the actor cheap to train despite the teacher's second-order autograd.
+- **Replay buffer.** Caching `(z_q, z_final)` pairs across epochs lets the teacher rollout amortize — one Mode-2 rollout per `Q` for the whole actor training run.
+- **Optional EBM-weighted loss.** Weight each training pair by `exp(−E(z_q, z_final, 0))` so the actor preferentially imitates the teacher's *confident* converged latents and ignores ones where Mode-2 itself didn't reach a good minimum. Cheap because the EBM is already on the GPU.
+
+### 5.4 Adaptive Mode-1 / Mode-2 inference
+
+At deployment, default to the fast actor and only escalate to the slow optimizer when the EBM says the actor's output is poor. The EBM acts as a built-in confidence scorer — no separate verifier needed.
+
+```python
+z_q     = LatentEnc(Q)
+z_hat   = Actor_theta(z_q)                     # one forward pass
+E_hat   = EnergyNet(z_q, z_hat, t=0)           # calibrated quality scalar (§2)
+
+if E_hat < threshold:                          # actor is confident
+    z_final = z_hat
+else:                                          # hard case → fall back to Mode-2
+    z_final = p_sample_loop(EnergyNet, z_q,
+                            T=T, N_inner=N_inner)
+    # optional: add (z_q, z_final) to the actor's replay buffer for later
+
+A = LatentDec(z_final)
+```
+
+The `threshold` is calibrated on a held-out set so that, say, 80% of queries take the Mode-1 path. Average inference cost becomes a tunable knob between one forward pass and the full `T × N_inner` rollout — and unlike a simple confidence head, the gate is *the same scalar* that defines correctness during Mode-2 training, so there's no second calibration problem.
 
 ---
 
@@ -157,30 +284,7 @@ This architecture has precedent for *generation*, not yet for energy-based reaso
 
 ## 7. Hard problems and design choices
 
-### 7.1 The encoder-decoder must be a real autoencoder
-
-Load-bearing assumption: `Decoder(Encoder(A)) ≈ A` for the answers in your domain. Candidates:
-
-| Choice | Latent shape | Pros | Cons |
-|---|---|---|---|
-| **T5 / BART (frozen)** | sequence of token embeddings | strong pretraining; works as autoencoder | latent length = answer length; unknown at inference |
-| **Sentence-T5 / Instructor / E5** | single vector | easy to diffuse | bottlenecks long answers |
-| **Custom perceiver-style autoencoder** | fixed `K` latents (e.g. 32–64) | controllable; LD4LG-validated | requires its own pretraining |
-| **LLaDA / discrete diffusion decoder** | fixed `K` latents | competitive non-AR quality | extra complexity |
-
-**Recommendation:** start with T5 + learned pooling to fixed `K=32` latents. Verify reconstruction on the target task before training the diffusion head. If `Decoder(Encoder(A))` doesn't reproduce `A`, the whole pipeline is dead — fix this first.
-
-### 7.2 Non-autoregressive decoding is harder than it looks
-
-Pure one-shot decoding from `z_0` loses the AR inductive bias responsible for most modern LM quality. Practical paths:
-
-- **AR decoder conditioned on `z_0`** — pragmatic compromise; the latent carries the semantic content, the decoder just serializes. Still AR in form but the latent does the heavy lifting.
-- **Mask-predict / parallel decoder** — truly non-AR; quality lags.
-- **Discrete diffusion decoder** (LLaDA-style) — non-AR and increasingly competitive.
-
-The strict reading of "truly think then decode" demands non-AR. The pragmatic reading allows AR-conditional decoding as long as the latent commits to the answer's semantic content before token emission begins.
-
-### 7.3 Why NCE matters here (revisiting the JEPA question)
+### 7.1 Why NCE matters here (revisiting the JEPA question)
 
 Yann LeCun's argument that contrastive terms can be dropped in JEPA-style models **does not transfer cleanly to this proposal**, for the same reason it doesn't transfer to IRED proper:
 
@@ -190,7 +294,7 @@ Yann LeCun's argument that contrastive terms can be dropped in JEPA-style models
 
 So `--supervise-energy-landscape True` is **load-bearing** for this proposal, not optional.
 
-### 7.4 Latent MSE alone may not punish the right errors
+### 7.2 Latent MSE alone may not punish the right errors
 
 The training loss in §5.1 lives entirely in latent space: `MSE(ε̂, ε)` over the K·d latent entries, plus the NCE energy contrast. This is the LD4LG / Stable-Diffusion recipe and is what we use as the default. But it has a known weakness for short discriminative outputs like GSM8K's final-answer mode:
 
@@ -200,19 +304,19 @@ The training loss in §5.1 lives entirely in latent space: `MSE(ε̂, ε)` over 
 The decoder *does* know this distinction — its CE loss explicitly punishes producing the wrong token. So a natural augmentation is to mix in a small frozen-decoder CE term:
 
 ```
-L = L_denoise + λ·L_nce + λ_dec · 1[t < t_max] · CE(Decoder(x0_hat), gold)
+L = L_denoise + λ·L_nce + λ_dec · 1[t < t_max] · CE(LatentDec(x0_hat), gold)
 ```
 
 where `x0_hat = predict_start_from_noise(z_t, t, ε̂)` is the model's current estimate of the clean latent. Two design notes:
 
-1. **Gate on low t.** `x0_hat` is only a reliable estimate of the clean latent near the end of the schedule. For early t the residual noise is large; backpropping decoder CE through a wildly-off `x0_hat` injects noise into the EBM. We restrict the auxiliary to `t < t_max` (default 2 of 10).
+1. **Gate on low t.** `x0_hat` is only a reliable estimate of the clean latent near the end of the schedule. For early t the residual noise is large; backpropping decoder CE through a wildly-off `x0_hat` injects noise into the EBM. I restrict the auxiliary to `t < t_max` (default 2 of 10).
 2. **Backprop, don't replace.** The decoder stays frozen — its params get zero gradient. But the CE loss depends on `x0_hat`, which depends on the EBM via `ε̂`. So gradient flows back to the EBM through the frozen decoder, treating the decoder as a fixed perceptual loss over latents.
 
 Why keep this as an auxiliary rather than the primary objective: as discussed in §7.3, the inner-loop bad-step rejection assumes ∇E points toward the data manifold. The latent MSE is what calibrates that. A decoder-CE-only loss would optimize ∇E toward "whatever latent the decoder happens to decode well," which isn't the same set — and would break the bad-step contract at inference.
 
 Default in this repo: `--decoder-aux-weight 0.0` (off, matches §5.1 exactly). Recommended for ablation on short-answer tasks: `--decoder-aux-weight 0.1 --decoder-aux-t-max 2`.
 
-### 7.5 LD4LG-faithful compression / reconstruction split
+### 7.3 LD4LG-faithful compression / reconstruction split
 
 The original draft of this proposal collapsed LD4LG's two-network design into a single "pool" module:
 
@@ -232,25 +336,21 @@ text → E_frozen → Pool (f_φ) → z ∈ R^(K×d_ae) → ReconstructionNet (f
 **Two distinct jobs**:
 
 1. **Compression** (`f_φ` = the pool). Maps a variable-length encoder hidden sequence to K latent slots that pack answer-relevant content densely.
-2. **Decoder compatibility** (`f_ψ` = the reconstruction network). Shapes those K slots into something the frozen T5 cross-attention can actually read. T5's decoder was trained on encoder outputs with specific statistical properties; arbitrary pool outputs aren't guaranteed to match.
+2. **LatentDec compatibility** (`f_ψ` = the reconstruction network). Shapes those K slots into something the frozen T5 cross-attention can actually read. T5's decoder was trained on encoder outputs with specific statistical properties; arbitrary pool outputs aren't guaranteed to match.
 
 These objectives pull in different directions: (1) wants information density (sparse, high-entropy, unique-per-input); (2) wants statistical similarity to natural T5 encoder hidden states (smoother, more redundant, on-manifold). Separating them lets each module specialize. This is the standard "separation of concerns" win that LD4LG (after Flamingo's Perceiver Resampler) validated empirically.
 
-**Two architectural fixes inside the pool itself**:
+**Pool attention pattern**: separated self-attn + cross-attn (`nn.TransformerLatentDecLayer`), not LD4LG's combined-MHA Perceiver Resampler. I tried the combined form first because the paper specifies it that way; it plateaued at loss ~7.6 with collapsed outputs across LR sweeps. See §12.6 for the post-mortem. The separated form has distinct `W_k/W_v` per attention role (self-attn vs. cross-attn) and is what actually trains on this task.
 
-LD4LG specifies the Perceiver Resampler update as
+The pool ends with a learnable linear projection `d_LM → d_ae` (no-op when `d_ae = d_LM`). This is the dimensionality knob — when the AE has converged, dropping `d_ae` shrinks the EBM's diffusion space by the same factor and is the most impactful lever for Milestone 2 tractability.
 
-```
-Z = Z + MHA(q = Z, kv = [Z; E(w)])
-```
+**Recon initialization**: each transformer block in `ReconstructionNet` is identity-initialized (attention `out_proj` and FF `linear2` zero-init'd) so the recon is bit-exact identity at step 0. Without this, the recon's random transforms scramble the pool's input-conditional signal and the frozen decoder falls back to unigram statistics. Validated: at random init, `decode_loss(with_recon) == decode_loss(without_recon)` to 6 decimal places. From step 1 the optimizer grows non-zero residuals as they become useful.
 
-— one MHA call per layer with keys/values being the **concatenation** of latents and encoder hidden states. Each attention head can dynamically allocate its budget between latent-latent mixing and encoder-extraction. The naïve `nn.TransformerDecoderLayer` substitute does two separate MHAs (self-attn over latents, then cross-attn to encoder), which forces every head into one role. Same parameter count, different inductive bias; the LD4LG-faithful combined-MHA version is what we use. See §11.6 for the failure mode of the separated variant.
-
-The pool also ends with a learnable linear projection `d_LM → d_ae` (no-op when `d_ae = d_LM`). This is the dimensionality knob — when the AE has converged, dropping `d_ae` shrinks the EBM's diffusion space by the same factor and is the most impactful lever for Milestone 2 tractability.
+I also dropped the trailing `LayerNorm` from the recon — three sequential LayerNorms in series (pool's final LN + recon's internal LNs + a trailing LN) over-normalized the latents and squashed the magnitude signal T5's decoder cross-attention was trained to read.
 
 **Two-step rollout**:
 
-We attempt these as separate steps so we can attribute which fix is doing the work.
+I attempt these as separate steps so we can attribute which fix is doing the work.
 
 - **Step 1 (default).** `d_ae = d_model = 768`. Adds the recon net and the combined-MHA pool without changing latent dimensionality. This isolates the "dual-role pool was the bottleneck" hypothesis. Diagnostic: does Milestone 1's final-answer extraction accuracy clear the 90% bar that the single-pool design plateaued well below?
 - **Step 2.** Drop `d_ae` to ~128 once Step 1 is verified. Shrinks the EBM diffusion space by ~6× — the structural fix for "the EBM has too many DoF to denoise into" that §7.4 motivated for short answers. Step 2 changes the EBM input shape, so M2 must be retrained.
@@ -259,29 +359,56 @@ We attempt these as separate steps so we can attribute which fix is doing the wo
 
 **Risk**: the bootstrap cost. With f_ψ at random init, the very first decode is *worse* than the single-pool version was at random init (one more random module in the path). At step 0 of Milestone 1 we observed `decode_loss ≈ 13.0` vs the pool-only random-init baseline of ~10.4. The model has to learn through this initial deficit. If you see eval loss still above 10 after a few hundred steps, that's pathological — but if it drops below 5 within the first eval cycle, you're on track.
 
-### 7.6 Inference cost
+---
+## 8. Wrap it Up
 
-Each inner step is one forward+backward through the energy network. For an IRED schedule with `T=10` outer × `N=5` inner = 50 transformer passes through the energy net, versus ~200 AR tokens of CoT through the full LLM. FLOPs-comparable if the energy net is ~1/4 the size of the decoder.
+Pulling §3–§7 together, the complete pipeline is five modules: two frozen (the T5 encoder and decoder), two learned for the autoencoder stage (the Compressor `f_φ` and the Reconstructor `f_ψ`), and one learned for the reasoning stage (the EBM).
 
-The bet: a steeper accuracy-vs-compute curve than AR-CoT, justifying the cost.
+```
+   Q ──▶ T5_Encode ──▶ f_φ (Compressor) ──▶  z_q ∈ R^(K×d_ae)
+                                              │
+                                              │   conditioning
+                                              ▼
+                       z_T ~ N(0, I)  ──▶  EBM(z_q, z, t)  ──▶  z_0
+                       (Mode-2: T outer × N_inner steps, bad-step rejection on E)
+                                              │
+                                              ▼
+                       z_0  ──▶  f_ψ (Reconstructor) ──▶ T5_Decode ──▶  A
+```
+
+(At training time, `z_a = f_φ(T5_Encode(A))` is the clean target the EBM denoises toward; at inference time only `z_q` is supplied and `z_0` is produced by the Mode-2 loop of §5.2.)
+
+**Training stages, in order:**
+
+1. **Autoencoder.** Train `f_φ` and `f_ψ` end-to-end against the frozen T5 reconstruction objective (`CE(T5_Decode(f_ψ(f_φ(T5_Encode(A)))), A)`). T5 stays frozen. Milestone 1 in §9 gates progression.
+2. **EBM (Mode-2 optimizer).** Freeze `f_φ`, `f_ψ`, and T5. Train the EBM with IRED's `L_denoise + λ·L_nce` (§5.1), with optional low-t frozen-decoder CE auxiliary (§7.4). Milestone 2 + 3 in §9 validate the thesis.
+3. **Mode-1 actor (optional, post-hoc).** Freeze everything from stages 1–2. Distill the trained Mode-2 optimizer into a one-shot `Actor_θ(z_q) → z*` per §5.3, and deploy with the adaptive Mode-1/Mode-2 gate of §5.4.
+
+**Mapping back to §1.2's three commitments:**
+
+- *Inference is optimization, not sampling.* The EBM stage runs reverse diffusion with bad-step rejection on a calibrated scalar `E` — gradient descent, not a generative model over reasoning traces.
+- *The cost is structurally anchored.* `z_a = f_φ(T5_Encode(A))` is fixed by the frozen encoder and a frozen-once compressor; nothing the EBM can learn drifts the target.
+- *The decoder transduces, it does not reason.* `f_ψ → T5_Decode` is invoked exactly once on `z_0`. All cognitive work happens in the latent loop, behind the actuator boundary.
+
+The next section is the smallest experiment that exercises all three stages on a real reasoning task and tests whether test-time compute in latent space actually buys accuracy.
 
 ---
 
-## 8. Concrete first experiment
+## 9. Concrete first experiment
 
 Realistic single-GPU prototype to validate the core thesis.
 
 **Setup (as originally proposed):**
 - **Task:** GSM8K (grade-school math). Short numeric answers, clean correctness signal.
-- **Encoder/Decoder:** `flan-t5-large`, frozen. Custom learned attention pool compresses encoder output to `K=32` latents.
+- **LatentEnc/LatentDec:** `flan-t5-large`, frozen. Custom learned attention pool compresses encoder output to `K=32` latents.
 - **Energy net:** 4-layer transformer over `concat(z_q, z_t, time_embed)`. Scalar output via squared-sum of final layer (matching `models.py:211`).
 - **Diffusion:** `T=10` timesteps, `continuous=True` (matrix-addition variant of `GaussianDiffusion1D`).
 - **Inner loop:** 5 steps with bad-step rejection.
 - **Loss:** denoising MSE + NCE with `λ=1`. Optional `--decoder-aux-weight 0.1 --decoder-aux-t-max 2` for a low-t frozen-decoder CE ablation (see §7.4).
 
-**Practical defaults that survived first-run debugging (see §11):**
+**Practical defaults that survived first-run debugging (see §12):**
 - **Model size:** `flan-t5-base` (d_model=768) for faster iteration. `large` is a drop-in.
-- **Autoencoder architecture:** LD4LG-faithful — `AttentionPool` (Perceiver Resampler with combined `MHA(q=Z, kv=[Z;E(w)])`) + explicit `ReconstructionNet` (f_ψ). See §7.5 for the rationale and §11.6 for what goes wrong without the combined MHA. Default `d_ae = d_model`; set lower (Step 2) once Milestone 1 is converged to shrink the EBM's diffusion space.
+- **Autoencoder architecture:** LD4LG-faithful — `AttentionPool` (Perceiver Resampler with combined `MHA(q=Z, kv=[Z;E(w)])`) + explicit `ReconstructionNet` (f_ψ). See §7.5 for the rationale and §12.6 for what goes wrong without the combined MHA. Default `d_ae = d_model`; set lower (Step 2) once Milestone 1 is converged to shrink the EBM's diffusion space.
 - **Pool/recon capacity:** `K=64, pool_layers=4, recon_layers=2` (~37M trainable AE params at d_model=768). The K=32 / 2-layer-pool / no-recon design plateaued at loss ~1.45.
 - **Answer mode:** `full` (the CoT ending in `#### N`), not `final` (just the number). With `K=32, d=768` the latent has ~24k DoF; a final-only answer carries ~60 bits, leaving the data manifold ~5 orders of magnitude smaller than the latent volume. The EBM can find the rough direction but can't precisely localize, and head magnitude inflates trying to compensate. Full mode also gives reasoning structure to denoise toward. Eval extracts `#### N` from decoded text rather than byte-exact matching.
 - **`max_a_length`:** `256` for full mode. Covers ~99% of GSM8K answers (p99=240, max=354). `128` (the previous default) truncates ~25% of the training set.
@@ -293,36 +420,39 @@ Realistic single-GPU prototype to validate the core thesis.
 - **Monitoring (per eval):** `ae_recon_acc, ebm_acc(inner=N), ebm_acc(inner=0), mse_z, std_zs, corr_z`. `ae_recon_acc` separates Milestone-1 failures from EBM failures; `inner=0` vs `inner=N` isolates whether `opt_step` is helping or hurting; `std_zs/std_za` and `corr_z` localize whether the failure is magnitude inflation, direction misalignment, or both.
 
 **Milestones:**
-1. **Autoencoder check** — confirm `Decoder(Pool(Encoder(A)))` reproduces GSM8K answers. If accuracy < 95% in `final` mode (a strict floor on pool fidelity), redesign the pool/decoder before going further. For `full` mode the bar is final-answer extraction accuracy ≥ 90% — the CoT body needn't byte-match, only the `#### N` must come back. *(Final-mode benchmark on flan-t5-base + 2-layer pool + K=32: 98.8% on GSM8K-test.)*
-2. **Diffusion training** — train energy net to convergence on GSM8K train set. *Watch `eps_scale` and the `e_real/e_fake` ratio over training; either drifting is the early warning sign §11.2 describes.*
+1. **Autoencoder check** — confirm `LatentDec(Pool(LatentEnc(A)))` reproduces GSM8K answers. If accuracy < 95% in `final` mode (a strict floor on pool fidelity), redesign the pool/decoder before going further. For `full` mode the bar is final-answer extraction accuracy ≥ 90% — the CoT body needn't byte-match, only the `#### N` must come back. *(Final-mode benchmark on flan-t5-base + 2-layer pool + K=32: 98.8% on GSM8K-test.)*
+2. **Diffusion training** — train energy net to convergence on GSM8K train set. *Watch `eps_scale` and the `e_real/e_fake` ratio over training; either drifting is the early warning sign §12.2 describes.*
 3. **Test-time compute curve** — plot accuracy vs. `N_inner × T` and compare to AR-CoT at matched FLOPs.
 
 **Decision rule:** if the diffusion curve is steeper than AR-CoT at matched compute, the thesis is validated. If it plateaus below AR-CoT, that's an informative negative result about smoothness of reasoning in latent space.
 
 ---
 
-## 9. Honest assessment
+## 10. Honest assessment
 
 **Promising aspects:**
-- Solves the "no `c*`" problem elegantly via the frozen encoder.
-- Cleanly separates thinking from surface-form generation — a sharper definition of "reasoning model" than current practice.
-- Test-time compute scaling via inner-loop steps is a natural fit for the o1-era frontier.
+- Solves the "no `c*`" problem elegantly via the frozen encoder — `LatentEnc(A)` is the structural anchor that §1.2's commitment (2) demands.
+- Cleanly separates thinking from surface-form generation — the actuator-style boundary that distinguishes true Mode-2 from latent-guided prompting.
+- Test-time compute scaling via inner-loop steps is a natural fit for the o1-era frontier, and is governed by an explicit cost rather than a sampling temperature.
 - Architectural precedent (Stable Diffusion, LD4LG) suggests the frozen-autoencoder approach is viable.
 
 **Risks:**
 - Autoencoder quality bottleneck — most teams who tried latent-diffusion-for-text reported "the decoder is the limiting factor."
 - RL-on-AR-CoT (DeepSeek-R1, o1) is currently the empirical winner. Any diffusion-based reasoning system has to justify *not* using RL.
 - Reasoning may not be smooth in latent space. If correct reasoning traces are isolated discrete modes rather than connected regions, diffusion will struggle.
+- The decoder-as-transducer assumption only holds for constrained output formats. This prototype targets math; the approach is structurally restricted to domains (code, formal logic, structured planning) where linguistic rendering doesn't itself require reasoning. Open-ended natural language is outside scope — not a temporary limitation but a real one.
+- Collapsing the composite anchored cost (§3.3) to a single target-encoder term is a deliberate simplification. If the single anchor turns out to be gameable in the LLM-latent setting, additional anchors (world-model coherence, counterfactual stability, capacity bottleneck) have to be added — and the bad-step-rejection contract has to be re-checked under each addition.
 
-**Why try it anyway:** the architecture is clean, the prior work is encouraging, and even a clear negative result tells us something concrete about the geometry of reasoning. Two-week prototype is feasible on a single GPU.
+**Why try it anyway.** The architecture is clean, the prior work is encouraging, and even a clear negative result tells us something concrete about the geometry of reasoning in continuous space. Brains, by every available indication, do not reason in language — language regions are largely inactive during reasoning, verbalization happens at output. If artificial reasoning systems are ever to operate at the level of fluid cognition that biological systems exhibit, the substrate likely has to be representational rather than lexical. The current "latent reasoning" literature gestures at this without implementing it; this prototype is the smallest concrete step toward the system the framework actually demands. Feasible on a single GPU in roughly two weeks.
 
 ---
 
-## 10. Code reference
+## 11. Code reference
 
-Code in this repo that maps directly to the proposal. Adapting to the LLM setting requires only swapping `(inp, opt_out)` for `(Encoder(Q), Encoder(A))` and replacing the MLP `EBM` with a transformer.
 
-### 10.1 The energy network — `EBM` (models.py)
+The following code block serve as anchor for the codes in the project, this is pulled directly from the IRED github repo `https://github.com/yilundu/ired_code_release`
+
+### 11.1 The energy network — `EBM` (models.py)
 
 A 4-layer MLP with FiLM-style time conditioning. The scalar energy is produced by squaring and summing the last layer's output.
 
@@ -381,7 +511,7 @@ class EBM(nn.Module):
         return output
 ```
 
-### 10.2 Scalar → vector — `DiffusionWrapper` (models.py)
+### 11.2 Scalar → vector — `DiffusionWrapper` (models.py)
 
 Takes a scalar energy and returns its gradient w.r.t. `opt_out`. The `create_graph=True` flag keeps the autograd graph alive so the outer training loss can backprop through this gradient operation.
 
@@ -413,7 +543,7 @@ class DiffusionWrapper(nn.Module):
             return opt_grad
 ```
 
-### 10.3 Inner loop with bad-step rejection — `opt_step` (denoising_diffusion_pytorch_1d.py)
+### 11.3 Inner loop with bad-step rejection — `opt_step` (denoising_diffusion_pytorch_1d.py)
 
 For each step inside the inner loop: take a gradient step on the energy, clamp to the diffusion envelope, then **reject** if the new energy is higher than the old one. This is the mechanism that requires `E` to be a *calibrated* scalar — which is why the NCE term in `p_losses` is load-bearing.
 
@@ -453,7 +583,7 @@ def opt_step(self, inp, img, t, mask, data_cond, step=5, eval=True, sf=1.0, deta
     return img
 ```
 
-### 10.4 Inference schedule — `p_sample_loop` (denoising_diffusion_pytorch_1d.py)
+### 11.4 Inference schedule — `p_sample_loop` (denoising_diffusion_pytorch_1d.py)
 
 Outer loop over diffusion timesteps `T..0`; at each step a standard denoising step followed by the inner `opt_step` refinement. The continuous-vs-discrete `sf` scaling lives here.
 
@@ -513,7 +643,7 @@ def p_sample_loop(self, batch_size, shape, inp, cond, mask, return_traj=False):
         preds.append(img_unscaled)
 ```
 
-### 10.5 Combined training loss — `p_losses` (denoising_diffusion_pytorch_1d.py)
+### 11.5 Combined training loss — `p_losses` (denoising_diffusion_pytorch_1d.py)
 
 The denoising MSE term plus the NCE energy contrast. For continuous tasks (matrix addition, inverse, lowrank) the contrast samples are produced by running `opt_step` on a heavily-noised version of the clean target — a "hard negative" mined from the current energy landscape.
 
@@ -597,11 +727,11 @@ def p_losses(self, inp, x_start, mask, t, noise=None):
 
 ---
 
-## 11. Implementation pitfalls (post-mortem)
+## 12. Implementation pitfalls (post-mortem)
 
-Five concrete bugs and infelicities surfaced when building the §8 prototype against the IRED reference code. None of them invalidate the proposal — but every one is a place where a default that worked for IRED's small tabular tasks fails silently in the latent-LLM setting. Listing them in one place so future implementers don't re-discover them.
+Five concrete bugs and infelicities surfaced when building the §9 prototype against the IRED reference code. None of them invalidate the proposal — but every one is a place where a default that worked for IRED's small tabular tasks fails silently in the latent-LLM setting. Listing them in one place so future implementers don't re-discover them.
 
-### 11.1 Diffusion β schedule blows up at small T
+### 12.1 Diffusion β schedule blows up at small T
 
 `linear_beta_schedule` in `denoising_diffusion_pytorch_1d.py` is
 
@@ -625,9 +755,9 @@ Any batch that samples one of those t values produces NaN loss; the first `opt.s
 
 **Better fix:** for small T, use `cosine` directly. The clipped-linear schedule at T=10 has β ≥ 0.999 for half its range, so the EBM only sees variance interpolations near t=0; it never gets useful gradient at intermediate noise levels.
 
-### 11.2 EBM head magnitude inflates unboundedly without weight decay
+### 12.2 EBM head magnitude inflates unboundedly without weight decay
 
-IRED's reference setup uses an MLP energy net on small (~tens-of-dims) tabular data with no weight decay. We inherited the no-weight-decay default. In the latent-LLM setting the head is a `Linear(d_model=768, d_model=768)` and the energy is the squared sum over `K · d_model = 24576` dims — so the absolute energy scale is enormous and grows freely.
+IRED's reference setup uses an MLP energy net on small (~tens-of-dims) tabular data with no weight decay. I inherited the no-weight-decay default. In the latent-LLM setting the head is a `Linear(d_model=768, d_model=768)` and the energy is the squared sum over `K · d_model = 24576` dims — so the absolute energy scale is enormous and grows freely.
 
 Observed in a 5000-step run:
 
@@ -644,7 +774,7 @@ Downstream consequence: `opt_step` bad-step rejection becomes inert (a 2% contra
 
 **Diagnostic:** the `eps_scale = ||ε̂|| / ||noise||` stat added to per-step logging surfaces this in one number — when head inflates, `eps_scale` drifts upward in lockstep.
 
-### 11.3 IRED's clamping bounds assume `[-1, 1]` data
+### 12.3 IRED's clamping bounds assume `[-1, 1]` data
 
 IRED hardcodes `x_start_clamp = 2` and `envelope_sf = 2` (the per-t `±sqrt(α̅_t)·sf` clamp inside `opt_step` and `p_sample_loop`). Both assume input data normalized to `[-1, 1]` — true for IRED's tabular tasks, false for LayerNorm'd T5 latents whose element std is ~1 and bulk lives in `[-3, 3]`.
 
@@ -654,15 +784,15 @@ Applied verbatim, these clamps crush noisy `z_t` to ~0 at large t (when `sqrt(α
 
 **Lesson:** any time you transplant IRED-style code to a new data domain, audit every literal numeric constant against the new data's empirical range. The original constants are a domain-specific tuning, not a general defaults.
 
-### 11.4 ε̂ scale drift is invisible to `mse(ε̂, ε)`
+### 12.4 ε̂ scale drift is invisible to `mse(ε̂, ε)`
 
 The denoising loss `mse(ε̂, ε)` is dominated by direction agreement — a 2× scale error contributes only `(2 - 1)^2 = 1` per-element to MSE, the same as a perpendicular unit-noise direction. So `mse` can look small (~0.02) while `||ε̂||` is drifting away from `||ε||`. DDPM's `predict_start_from_noise` and `q_posterior` math assume ε̂ is at noise-scale; if it isn't, the reverse process inflates or deflates `z` magnitude regardless of how good the *direction* is.
 
 In our broken 5000-step run, the symptom was `std(z_sampled) = 2.75` vs `std(z_a) = 1.00` after sampling — magnitude inflated almost 3× while `mse(ε̂, ε)` was 0.017 at train time.
 
-**Fix:** log `eps_scale = ||ε̂||_2 / ||ε||_2` per training step. It's free (one no_grad norm) and is the earliest detector of the §11.2 head-inflation problem.
+**Fix:** log `eps_scale = ||ε̂||_2 / ||ε||_2` per training step. It's free (one no_grad norm) and is the earliest detector of the §12.2 head-inflation problem.
 
-### 11.5 PyTorch fast SDPA kernels don't implement double-backward
+### 12.5 PyTorch fast SDPA kernels don't implement double-backward
 
 IRED's training loss takes MSE against ε̂ = ∇<sub>z</sub>E, so the outer `loss.backward()` differentiates *through* an inner `autograd.grad(...).` This is a second-order autograd path through every attention call inside the EBM. PyTorch's default flash and mem-efficient SDPA kernels don't implement the backward-of-backward; on CPU you get
 
@@ -685,32 +815,26 @@ This costs throughput vs flash attention, but is the only kernel that supports d
 
 ---
 
-### 11.6 `nn.TransformerDecoderLayer` is not a Perceiver Resampler
+### 12.6 LD4LG-literal Perceiver Resampler did not work; reverted to separated attention
 
-When implementing LD4LG's compression network, the obvious shortcut is to use PyTorch's `nn.TransformerDecoderLayer` as the per-layer building block — it already does cross-attention from a target sequence to a memory sequence, which superficially matches "K latent queries attending to encoder hidden states." We did this initially and Milestone 1 plateaued at loss ≈ 1.45 (token p ≈ 0.23).
-
-The deviation: `nn.TransformerDecoderLayer` does **two separate** MHA calls per layer:
+The naïve compression-network implementation uses `nn.TransformerLatentDecLayer` (separate self-attention then cross-attention). That plateaued Milestone 1 at loss ≈ 1.45 with input-conditional outputs — the model was clearly using the latent code but couldn't push past a certain reconstruction fidelity. The hypothesis was that LD4LG's combined-MHA Perceiver Resampler block,
 
 ```
-x = x + self_attn(x, x, x)                # latent → latent only
-x = x + cross_attn(x, memory, memory)     # latent → encoder only
-x = x + ff(x)
-```
-
-LD4LG / Perceiver Resampler / Flamingo specifies **one combined** MHA per layer:
-
-```
-Z = Z + MHA(q = Z, kv = [Z; E(w)])        # each head decides its own latent↔encoder split
+Z = Z + MHA(q = Z, kv = [Z; E(w)])
 Z = Z + FF(Z)
 ```
 
-Same parameter count, materially different inductive bias. In the separated form, every attention head is forced into exactly one role — extract-from-encoder *or* mix-with-other-latents — and the role is fixed at architecture time. In the combined form, each head sees `K + L` positions in its KV set and can dynamically split its softmax mass between them. For a compression task with shallow stacks (we used 2 layers initially), this matters: the combined form gives the model more flexibility to specialize heads on demand.
+would let each head dynamically allocate attention budget between latents and encoder, vs. the separated form's strict role assignment. I implemented it as a custom `PerceiverResamplerLayer`.
 
-**Fix:** custom `PerceiverResamplerLayer` that concatenates `[Z; E(w)]` and does one MHA call per layer. ~30 lines. Drops in transparently because input/output shapes are unchanged.
+**It made things dramatically worse.** Milestone 1 with the combined-MHA pool plateaued at loss ≈ 7.6 across multiple LR settings (3e-4, 1e-4, and a 1000-step warmup from 0 to 1e-4 — the loss curves were *identical*, ruling out optimization). Predictions collapsed to a unigram-like mode: every input decoded to the same `>>>>>>>>` token stream (`>>` being a common substring in GSM8K's `<<...>>` calculation markers).
 
-**Diagnostic:** if Milestone 1 plateaus at a loss that's significantly above `log(vocab) / 5` ≈ 2 — i.e. the model has learned *some* structure but not enough — and the per-K-position attention patterns look "monolithic" (every head doing the same thing), suspect the separated-attention form.
+**The most plausible mechanism:** the combined form forces a single `W_k, W_v` pair to project *both* the latent slots *and* the encoder hidden states. These two roles want different projections — latents are LayerNorm'd identity-shared queries; encoder hidden states are content-bearing input-conditional vectors. The separated form has two distinct projection pairs (one for self-attn, one for cross-attn) so each role specializes from the first SGD step. The combined form has to either compromise or get stuck — and on the GSM8K-CoT task with frozen T5, it gets stuck.
 
-**Lesson:** when a paper's architecture is described as a single formula, that's usually a signal. Two separate MHA calls would be `Z = Z + SA(Z); Z = Z + CA(Z, E)` — they wrote it as one for a reason. Don't substitute "close enough" library primitives without auditing the attention pattern.
+**Diagnostic that pinpointed it:** with the identity-initialized ReconstructionNet (§7.5) producing bit-exact identity at step 0, recon could not be the source of collapse at the initial eval. Yet the collapse was visible immediately. By elimination, the pool was the problem. LR sweeps producing identical loss curves confirmed it wasn't optimization.
+
+**Fix:** reverted `AttentionPool` to `nn.TransformerLatentDecLayer`. Keeps the LD4LG-style explicit `f_φ` / `f_ψ` separation and the `d_ae` projection, but uses the separated-attention pool that has empirical evidence of working on this task.
+
+**Lesson:** when a paper's formula doesn't translate to your setting, it doesn't mean you implemented it wrong — sometimes the paper's design is calibrated for a different (data, encoder, decoder, scale) regime and doesn't transfer. Empirical falsification (matched loss curves across LR sweeps) is faster than mechanistic debate. The "literal-fidelity vs. what-works" tradeoff was decided by data, not by re-reading the paper.
 
 ---
 

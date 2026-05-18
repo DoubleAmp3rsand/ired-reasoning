@@ -1,6 +1,6 @@
-"""Frozen T5 autoencoder with LD4LG-faithful compression / reconstruction split.
+"""Frozen T5 autoencoder with compression / reconstruction split.
 
-This is the Stable-Diffusion-style "VAE" in the gensis.md proposal:
+Pipeline:
 
     text → E_frozen → AttentionPool (f_φ) → z ∈ R^(K × d_ae)
                                               │
@@ -16,17 +16,20 @@ This is the Stable-Diffusion-style "VAE" in the gensis.md proposal:
                                               ▼
                                        D_frozen → text
 
-Two design choices that follow LD4LG (Lovelace et al., NeurIPS 2023):
+Two pool implementations live here, selectable via `pool_type`:
 
-1. **Perceiver Resampler attention pattern.** Each pool layer does ONE MHA
-   call with `q = Z, kv = [Z; E(w)]` instead of separate self-attention then
-   cross-attention. Each head can dynamically split its attention budget
-   between latent-latent mixing and encoder-extraction; see §7.6, §11.6.
+- `"decoder"` (default): each block does separate self-attention then
+  cross-attention, via `nn.TransformerDecoderLayer`. Distinct `W_k/W_v` per
+  role. Empirically reaches loss ≈ 1.45 on GSM8K-full.
+- `"resampler"`: Flamingo-style Perceiver Resampler — one MHA per block
+  with `kv = concat([Z; E(w)])`. This is what LD4LG specifies. Includes the
+  two fixes that our first attempt was missing: (a) shared LayerNorm for
+  the KV path so latent and encoder positions are normalized identically
+  before sharing `W_k/W_v`; (b) gated residuals (`tanh(α)` with α=0 init)
+  so each block is bit-exact identity at step 0.
 
-2. **Explicit reconstruction network f_ψ.** Decouples the pool's compression
-   job from the "shape latents for the frozen decoder" job. With `d_ae < d_LM`
-   it also performs the up-projection that lets the EBM diffuse in a smaller
-   space. Default `d_ae = d_model` (Step 1 of the rollout in §7.6).
+`ReconstructionNet` (f_ψ) is identity-initialized so it's bit-exact identity
+at step 0 — gradient descent grows non-zero residuals as it becomes useful.
 
 Milestone 1 in gensis.md is verifying that
     Decoder(Recon(Pool(Encoder(A)))) ≈ A
@@ -40,17 +43,30 @@ from transformers import AutoTokenizer, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
 
+POOL_TYPES = ("decoder", "resampler")
+
+
 class PerceiverResamplerLayer(nn.Module):
-    """One block of the Perceiver Resampler (Flamingo §3.1.1; LD4LG eq.).
+    """One Flamingo-style Perceiver Resampler block (LD4LG-faithful).
 
-    Implements the LD4LG attention update:
+    Update rule (Flamingo §3.1.1; LD4LG eq. on p.4):
 
-        Z = Z + MHA(q = Z, kv = [Z; E(w)])
-        Z = Z + FF(Z)
+        Z = Z + tanh(α_xattn) · MHA(q = LN_q(Z), kv = LN_kv([Z; E(w)]))
+        Z = Z + tanh(α_ff)    · FF(LN_ff(Z))
 
-    The single combined MHA call (vs. separate self-attn + cross-attn) lets
-    each head allocate attention dynamically between the latent slots and
-    encoder positions, rather than forcing strict separation. See §11.6.
+    Two details that mattered (and were wrong in our first attempt; §11.6):
+
+    1. **Shared LayerNorm for the KV path.** A single `LayerNorm` applied to
+       the *concatenated* `[Z; E(w)]` means latents and encoder positions are
+       normalized with the same gain/bias. The shared `W_k`, `W_v` projections
+       then see distributionally-comparable inputs from both halves of KV.
+       Separate LNs (our earlier bug) gave the two halves different stats,
+       and the shared projection couldn't fit both.
+
+    2. **Gated residuals with α init = 0.** At step 0, `tanh(0) = 0` so each
+       block is bit-exact identity — no random transforms in the residual
+       stream that could swamp the pool's input-conditional signal. The
+       optimizer grows `α` as the block becomes useful.
     """
 
     def __init__(self, d_model: int, n_heads: int = 8, dim_ff_mult: int = 4):
@@ -66,6 +82,9 @@ class PerceiverResamplerLayer(nn.Module):
             nn.GELU(),
             nn.Linear(dim_ff_mult * d_model, d_model),
         )
+        # Flamingo gated residuals: α starts at 0 → tanh(α) = 0 → identity at init.
+        self.alpha_xattn = nn.Parameter(torch.zeros(1))
+        self.alpha_ff    = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -75,35 +94,42 @@ class PerceiverResamplerLayer(nn.Module):
     ) -> torch.Tensor:
         b, k, _ = z.shape
 
-        z_n  = self.norm_q(z)
-        kv   = torch.cat([z_n, self.norm_kv(enc_hidden)], dim=1)   # (B, K+L, d)
+        # Single shared LN applied to the concatenation: same gain/bias for
+        # all K+L positions. Equivalent to applying norm_kv separately to z
+        # and enc_hidden since LayerNorm is per-position.
+        kv_raw = torch.cat([z, enc_hidden], dim=1)               # (B, K+L, d)
+        kv = self.norm_kv(kv_raw)
 
         if enc_mask is not None:
             latent_keep = torch.ones((b, k), dtype=enc_mask.dtype, device=enc_mask.device)
-            kv_keep = torch.cat([latent_keep, enc_mask], dim=1)    # (B, K+L)
-            key_padding_mask = ~kv_keep.bool()                     # True = mask
+            kv_keep = torch.cat([latent_keep, enc_mask], dim=1)  # (B, K+L)
+            key_padding_mask = ~kv_keep.bool()                   # True = mask
         else:
             key_padding_mask = None
 
         attn_out, _ = self.attn(
-            z_n, kv, kv,
+            self.norm_q(z), kv, kv,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        z = z + attn_out
-        z = z + self.ff(self.norm_ff(z))
+        z = z + torch.tanh(self.alpha_xattn) * attn_out
+        z = z + torch.tanh(self.alpha_ff)    * self.ff(self.norm_ff(z))
         return z
 
 
 class AttentionPool(nn.Module):
-    """LD4LG-faithful compression network f_φ.
+    """Compression network f_φ. Variable-length encoder → fixed K latents.
 
-    Stack of `PerceiverResamplerLayer`s with K trainable latent queries.
-    Outputs `(B, K, d_ae)` — the diffusion-space latent. The final linear
-    projection (d_model → d_ae) matches LD4LG's "we reduce the dimensionality
-    of the output to dimension d_ae with a learnable linear projection."
+    Two attention patterns are supported via `pool_type`:
 
-    When `d_ae == d_model` the projection is `nn.Identity` (no parameters).
+    - `"decoder"`: `nn.TransformerDecoderLayer` stack. Separate self-attn
+      then cross-attn per block; distinct `W_k/W_v` per role.
+    - `"resampler"`: Flamingo-style Perceiver Resampler stack. One combined
+      MHA per block with `kv = [Z; E(w)]`, shared LayerNorm on the KV path,
+      gated residuals (identity at init).
+
+    Final linear projection `d_model → d_ae` matches LD4LG's dimensionality
+    reduction. `nn.Identity` when `d_ae == d_model`.
     """
 
     def __init__(
@@ -114,16 +140,34 @@ class AttentionPool(nn.Module):
         n_layers: int = 2,
         dim_ff_mult: int = 4,
         d_ae: int | None = None,
+        pool_type: str = "decoder",
     ):
         super().__init__()
+        if pool_type not in POOL_TYPES:
+            raise ValueError(f"pool_type must be one of {POOL_TYPES}, got {pool_type!r}")
+        self.pool_type = pool_type
         self.k = k
         self.d_model = d_model
         self.d_ae = d_ae if d_ae is not None else d_model
         self.queries = nn.Parameter(torch.randn(k, d_model) * 0.02)
-        self.layers = nn.ModuleList([
-            PerceiverResamplerLayer(d_model, n_heads, dim_ff_mult)
-            for _ in range(n_layers)
-        ])
+
+        if pool_type == "decoder":
+            layer = nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_ff_mult * d_model,
+                dropout=0.0,
+                batch_first=True,
+                norm_first=True,
+                activation="gelu",
+            )
+            self.attn = nn.TransformerDecoder(layer, num_layers=n_layers)
+        else:  # "resampler"
+            self.layers = nn.ModuleList([
+                PerceiverResamplerLayer(d_model, n_heads, dim_ff_mult)
+                for _ in range(n_layers)
+            ])
+
         # LD4LG's "learnable linear projection" to d_ae.
         self.out_proj = (
             nn.Linear(d_model, self.d_ae) if self.d_ae != d_model else nn.Identity()
@@ -136,10 +180,16 @@ class AttentionPool(nn.Module):
         enc_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         b = enc_hidden.size(0)
-        z = self.queries.unsqueeze(0).expand(b, -1, -1).contiguous()  # (B, K, d_model)
-        for layer in self.layers:
-            z = layer(z, enc_hidden, enc_mask)
-        z = self.out_proj(z)                                          # (B, K, d_ae)
+        z = self.queries.unsqueeze(0).expand(b, -1, -1).contiguous()
+
+        if self.pool_type == "decoder":
+            mem_pad = ~enc_mask.bool() if enc_mask is not None else None
+            z = self.attn(tgt=z, memory=enc_hidden, memory_key_padding_mask=mem_pad)
+        else:  # "resampler"
+            for layer in self.layers:
+                z = layer(z, enc_hidden, enc_mask)
+
+        z = self.out_proj(z)
         return self.norm(z)
 
 
@@ -224,6 +274,7 @@ class FrozenT5Autoencoder(nn.Module):
         k: int = 32,
         pool_layers: int = 2,
         pool_heads: int = 8,
+        pool_type: str = "decoder",
         d_ae: int | None = None,
         recon_layers: int = 2,
         recon_heads: int = 8,
@@ -237,6 +288,7 @@ class FrozenT5Autoencoder(nn.Module):
         self.d_ae = d_ae if d_ae is not None else self.d_model
         self.k = k
         self.use_recon = use_recon
+        self.pool_type = pool_type
 
         self.pool = AttentionPool(
             d_model=self.d_model,
@@ -244,6 +296,7 @@ class FrozenT5Autoencoder(nn.Module):
             n_heads=pool_heads,
             n_layers=pool_layers,
             d_ae=self.d_ae,
+            pool_type=pool_type,
         )
         if self.use_recon:
             self.recon: nn.Module = ReconstructionNet(
@@ -383,14 +436,15 @@ class FrozenT5Autoencoder(nn.Module):
         return params
 
     def state_dict_ae(self) -> dict:
-        """Save format: {pool, recon, d_ae, use_recon}. Both modules go
-        together because they were trained jointly and only make sense as
+        """Save format: {pool, recon, d_ae, use_recon, pool_type}. Both modules
+        go together because they were trained jointly and only make sense as
         a pair. When use_recon=False, the recon entry is None."""
         return {
             "pool":      self.pool.state_dict(),
             "recon":     self.recon.state_dict() if self.use_recon else None,
             "d_ae":      self.d_ae,
             "use_recon": self.use_recon,
+            "pool_type": self.pool_type,
         }
 
     def load_ae(self, state_dict: dict) -> None:
@@ -405,6 +459,13 @@ class FrozenT5Autoencoder(nn.Module):
             raise ValueError(
                 f"checkpoint has use_recon={saved_use_recon} but this AE was "
                 f"built with use_recon={self.use_recon}. Construct to match."
+            )
+        # Default to "decoder" for back-compat with pre-pool_type checkpoints.
+        saved_pool_type = state_dict.get("pool_type", "decoder")
+        if saved_pool_type != self.pool_type:
+            raise ValueError(
+                f"checkpoint has pool_type={saved_pool_type!r} but this AE was "
+                f"built with pool_type={self.pool_type!r}. Construct to match."
             )
         self.pool.load_state_dict(state_dict["pool"])
         if self.use_recon:

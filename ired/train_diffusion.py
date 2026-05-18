@@ -36,6 +36,8 @@ def build_parser():
     p.add_argument("--k", type=int, default=32)
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
+    p.add_argument("--pool-type", choices=["decoder", "resampler"], default="decoder",
+                   help="Must match the AE checkpoint's pool_type.")
     p.add_argument("--d-ae", type=int, default=-1,
                    help="diffusion-space latent dim. Must match the AE checkpoint.")
     p.add_argument("--recon-layers", type=int, default=2)
@@ -168,6 +170,7 @@ def main(argv=None):
         k=args.k,
         pool_layers=args.pool_layers,
         pool_heads=args.pool_heads,
+        pool_type=args.pool_type,
         d_ae=d_ae,
         recon_layers=args.recon_layers,
         recon_heads=args.recon_heads,
