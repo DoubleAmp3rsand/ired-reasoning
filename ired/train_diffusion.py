@@ -82,6 +82,11 @@ def build_parser():
     p.add_argument("--rand-neg-margin", type=float, default=1.0,
                    help="margin in softplus(e_real - e_rand + margin). Larger = "
                         "stronger push for a real energy gap.")
+    p.add_argument("--rand-neg-t-max", type=int, default=1_000_000,
+                   help="only apply the rand-neg anchor for samples with "
+                        "t < this. At high t, q(z_t|z_a) and N(0,I) overlap, "
+                        "so the anchor there fights eps prediction. With T=10, "
+                        "try 3 (low-noise only).")
     # data & opt
     p.add_argument("--train-dataset", choices=["mbpp"], default="mbpp",
                    help="Corpus the EBM trains on. Only MBPP is wired in by default; "
@@ -313,6 +318,7 @@ def main(argv=None):
             decoder_aux_t_max=args.decoder_aux_t_max,
             rand_neg_weight=args.rand_neg_weight,
             rand_neg_margin=args.rand_neg_margin,
+            rand_neg_t_max=args.rand_neg_t_max,
         ).to(args.device)
         diffusion.train()
 
@@ -325,7 +331,7 @@ def main(argv=None):
         if args.rand_neg_weight > 0:
             r.log(
                 f"rand-neg anchor enabled: weight={args.rand_neg_weight} "
-                f"margin={args.rand_neg_margin}"
+                f"margin={args.rand_neg_margin} t_max={args.rand_neg_t_max}"
             )
 
         n_params = sum(p.numel() for p in ebm.parameters())

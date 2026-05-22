@@ -84,8 +84,14 @@ class GaussianLatentDiffusion(nn.Module):
         # E(real) + margin < E(rand) via softplus. Directly attacks the
         # NCE-collapse mode where mined negatives drift into the same low-
         # energy region as positives, leaving E(gold) ≈ E(random).
+        # rand_neg_t_max gates the anchor to samples with t < this value:
+        # at high t, q(z_t|z_a) and N(0, I) overlap, so forcing separation
+        # there imposes structure the data distribution doesn't have and
+        # crowds out gradient signal for the eps prediction. Default is a
+        # sentinel large value so the anchor fires at every t unless gated.
         rand_neg_weight: float = 0.0,
         rand_neg_margin: float = 1.0,
+        rand_neg_t_max: int = 1_000_000,
     ):
         super().__init__()
         self.model = model
@@ -101,6 +107,7 @@ class GaussianLatentDiffusion(nn.Module):
         self.decoder_aux_t_max = int(decoder_aux_t_max)
         self.rand_neg_weight = float(rand_neg_weight)
         self.rand_neg_margin = float(rand_neg_margin)
+        self.rand_neg_t_max = int(rand_neg_t_max)
         self._decoder_loss_fn: DecoderLossFn | None = None
 
         if beta_schedule == "linear":
@@ -389,16 +396,29 @@ class GaussianLatentDiffusion(nn.Module):
         # Random-negative anchor: force E(real) + margin < E(N(0,I)) at the
         # same t as the NCE comparison. softplus(e_real - e_rand + margin) is
         # a one-sided margin: zero gradient once the gap exceeds `margin`,
-        # full gradient when e_rand is anywhere near e_real.
+        # full gradient when e_rand is anywhere near e_real. Gated by t so
+        # the anchor only fires at low noise levels where the data
+        # distribution and N(0, I) are actually distinguishable.
         if self.rand_neg_weight > 0:
-            z_rand = torch.randn_like(z_a)
-            e_rand = self.model(z_q, z_rand, t, return_energy=True)  # (B, 1)
-            loss_rand = F.softplus(
-                e_real - e_rand + self.rand_neg_margin
-            ).mean()
-            loss_total = loss_total + self.rand_neg_weight * loss_rand
-            stats["rand"] = loss_rand.item()
-            stats["e_rand"] = e_rand.mean().item()
+            rand_mask = t < self.rand_neg_t_max
+            if bool(rand_mask.any()):
+                idx_r = rand_mask.nonzero(as_tuple=True)[0]
+                z_q_sub = z_q.index_select(0, idx_r)
+                t_sub = t.index_select(0, idx_r)
+                e_real_sub = e_real.index_select(0, idx_r)
+                z_rand = torch.randn_like(z_q_sub)
+                e_rand = self.model(z_q_sub, z_rand, t_sub, return_energy=True)
+                loss_rand = F.softplus(
+                    e_real_sub - e_rand + self.rand_neg_margin
+                ).mean()
+                loss_total = loss_total + self.rand_neg_weight * loss_rand
+                stats["rand"] = loss_rand.item()
+                stats["e_rand"] = e_rand.mean().item()
+                stats["rand_n"] = int(rand_mask.sum().item())
+            else:
+                stats["rand"] = 0.0
+                stats["e_rand"] = 0.0
+                stats["rand_n"] = 0
 
         loss_total, stats = self._maybe_add_decoder_aux(
             loss_total, stats, z_t, eps_hat, t, gold_texts
