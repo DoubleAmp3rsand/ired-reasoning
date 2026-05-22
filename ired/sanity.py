@@ -1,5 +1,5 @@
 """Quick shape / forward-pass sanity check. Runs entirely on CPU with random
-inputs — no GSM8K download needed. Good for verifying the wiring before
+inputs — no dataset download needed. Good for verifying the wiring before
 launching a real training run.
 """
 from __future__ import annotations
@@ -8,15 +8,15 @@ import argparse
 
 import torch
 
-from ired.autoencoder import FrozenT5Autoencoder
+from ired.autoencoder import FrozenBartAutoencoder
 from ired.diffusion import GaussianLatentDiffusion
 from ired.energy_net import DiffusionWrapper, EnergyTransformer
 
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="google/flan-t5-base")
-    p.add_argument("--k", type=int, default=32)
+    p.add_argument("--model", default="facebook/bart-base")
+    p.add_argument("--k", type=int, default=128)
     p.add_argument("--d-ae", type=int, default=-1,
                    help="-1 = d_model. Smaller = test the LD4LG dim-reduction path.")
     p.add_argument("--ebm-layers", type=int, default=4)
@@ -30,7 +30,7 @@ def main(argv=None):
     d_ae = args.d_ae if args.d_ae > 0 else None
 
     print(f"[1/4] loading autoencoder ({args.model}, d_ae={'d_model' if d_ae is None else d_ae}) ...")
-    ae = FrozenT5Autoencoder(model_name=args.model, k=args.k, d_ae=d_ae).to(device)
+    ae = FrozenBartAutoencoder(model_name=args.model, k=args.k, d_ae=d_ae).to(device)
     ae.eval()
     print(f"     d_model={ae.d_model}  d_ae={ae.d_ae}")
 

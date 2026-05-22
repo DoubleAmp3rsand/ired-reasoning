@@ -11,7 +11,7 @@ Pipeline per step:
   loss.backward()
   opt.step()
 
-Everything except the actor is frozen: the T5 encoder/decoder, the AttentionPool
+Everything except the actor is frozen: the BART encoder/decoder, the AttentionPool
 + ReconstructionNet (loaded from the AE checkpoint), and the EBM (loaded from
 the EBM checkpoint). `p_sample_loop` is run under `no_grad`; `z_final` is a
 plain regression target. That's what makes the actor cheap to train despite the
@@ -43,8 +43,14 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from ired.actor import Actor
-from ired.autoencoder import FrozenT5Autoencoder
-from ired.data import GSM8KDataset, collate, extract_final_answer
+from ired.autoencoder import FrozenBartAutoencoder
+from ired.data import (
+    HumanEvalDataset,
+    MBPPDataset,
+    PreTokenizedDataset,
+    make_collate_pretokenized,
+    verify_code_batch,
+)
 from ired.diffusion import GaussianLatentDiffusion
 from ired.energy_net import DiffusionWrapper, EnergyTransformer
 
@@ -52,10 +58,10 @@ from ired.energy_net import DiffusionWrapper, EnergyTransformer
 def build_parser():
     p = argparse.ArgumentParser(description="Distill Mode-2 IRED into a Mode-1 actor")
     # autoencoder (must match the AE + EBM checkpoints exactly)
-    p.add_argument("--model", default="google/flan-t5-base")
+    p.add_argument("--model", default="facebook/bart-base")
     p.add_argument("--ae-ckpt", required=True)
     p.add_argument("--ebm-ckpt", required=True)
-    p.add_argument("--k", type=int, default=32)
+    p.add_argument("--k", type=int, default=128)
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
     p.add_argument("--pool-type", choices=["decoder", "resampler"], default="decoder")
@@ -84,7 +90,12 @@ def build_parser():
                    help=">0 enables an in-memory cache keyed by question text. "
                         "On hit, skip the teacher rollout.")
     # data & opt
-    p.add_argument("--answer-mode", choices=["final", "full"], default="full")
+    p.add_argument("--train-dataset", choices=["mbpp"], default="mbpp",
+                   help="Distillation corpus. Must use the same corpus the teacher "
+                        "EBM was trained on so the actor learns to imitate where the "
+                        "teacher is competent.")
+    p.add_argument("--mbpp-config", choices=["full", "sanitized"], default="full",
+                   help="MBPP HF config.")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -92,8 +103,10 @@ def build_parser():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--save-dir", default="checkpoints/actor")
-    p.add_argument("--max-q-length", type=int, default=256)
-    p.add_argument("--max-a-length", type=int, default=256)
+    p.add_argument("--max-q-length", type=int, default=512)
+    p.add_argument("--max-a-length", type=int, default=384)
+    p.add_argument("--eval-n-examples", type=int, default=80,
+                   help="per-corpus examples to score each eval cycle.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--num-workers", type=int, default=2)
@@ -126,21 +139,28 @@ class ReplayBuffer:
 
 @torch.no_grad()
 def teacher_rollout(
-    ae: FrozenT5Autoencoder,
+    ae: FrozenBartAutoencoder,
     diffusion: GaussianLatentDiffusion,
     questions: list[str],
     device: str,
     max_q_length: int,
     inner_steps: int,
     buffer: ReplayBuffer | None,
+    q_input_ids: torch.Tensor | None = None,
+    q_attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (z_q, z_final) for the batch. Uses `buffer` when populated.
 
     Misses on the buffer trigger a single fresh teacher rollout for the missing
     sub-batch; hits are reused from cache. Both halves are stitched back into
     the original batch order so the caller never has to think about it.
+
+    Pass `q_input_ids` + `q_attention_mask` to skip the tokenizer call.
     """
-    z_q = ae.encode_to_latents(questions, device, max_length=max_q_length)
+    if q_input_ids is not None:
+        z_q = ae.encode_to_latents_from_ids(q_input_ids, q_attention_mask)
+    else:
+        z_q = ae.encode_to_latents(questions, device, max_length=max_q_length)
 
     if buffer is None:
         z_final = diffusion.sample(z_q, inner_steps=inner_steps)
@@ -166,26 +186,25 @@ def teacher_rollout(
 
 
 @torch.no_grad()
-def eval_actor(
-    ae: FrozenT5Autoencoder,
+def eval_actor_corpus(
+    ae: FrozenBartAutoencoder,
     diffusion: GaussianLatentDiffusion,
     ebm: EnergyTransformer,
     actor: Actor,
-    loader,
+    dataset,
+    dataset_name: str,
     device: str,
     max_q_length: int,
     max_a_length: int,
     inner_steps: int,
-    n_batches: int = 5,
+    n_examples: int = 80,
+    batch_size: int = 16,
 ) -> dict:
-    """Joint eval comparing actor (Mode-1) and IRED (Mode-2) on the same batches.
+    """Joint eval comparing actor (Mode-1) and IRED (Mode-2) on a single corpus.
 
-      actor_acc   : decode(actor(z_q))
-      ebm_acc     : decode(p_sample_loop(z_q, inner_steps))   — reference upper bound
-      mse_z       : MSE between actor output and the teacher's z_final
-      corr_z      : cosine sim between actor output and z_final
-      e_actor     : mean E(z_q, actor(z_q), 0) — the §5.4 confidence scalar
-      e_teacher   : mean E(z_q, z_final, 0) — what the gate compares against
+      actor_acc   : per-corpus correctness on decode(actor(z_q))
+      ebm_acc     : per-corpus correctness on decode(p_sample_loop(z_q))
+      mse_z, corr_z, e_actor, e_teacher: latent/energy diagnostics
     """
     actor.eval()
     diffusion.eval()
@@ -194,10 +213,14 @@ def eval_actor(
     cos_sum = 0.0
     e_actor_sum = e_teacher_sum = 0.0
     samples = []
-    for i, batch in enumerate(loader):
-        if i >= n_batches:
-            break
-        z_q = ae.encode_to_latents(batch["question"], device, max_length=max_q_length)
+    n = min(n_examples, len(dataset))
+    for start in range(0, n, batch_size):
+        batch_idx = list(range(start, min(start + batch_size, n)))
+        batch_examples = [dataset[i] for i in batch_idx]
+        questions = [b["question"] for b in batch_examples]
+        answers = [b["answer"] for b in batch_examples]
+
+        z_q = ae.encode_to_latents(questions, device, max_length=max_q_length)
         b = z_q.size(0)
 
         z_final = diffusion.sample(z_q, inner_steps=inner_steps)
@@ -215,25 +238,26 @@ def eval_actor(
         e_actor_sum += ebm(z_q, z_hat, t0).sum().item()
         e_teacher_sum += ebm(z_q, z_final, t0).sum().item()
 
-        for p_a, p_e, gold, q in zip(
-            preds_actor, preds_ebm, batch["answer"], batch["question"]
-        ):
+        ok_actor_l = verify_code_batch(preds_actor, batch_examples)
+        ok_ebm_l   = verify_code_batch(preds_ebm,   batch_examples)
+        for p_a, p_e, gold, q, ok_a, ok_e in zip(
+                preds_actor, preds_ebm, answers, questions,
+                ok_actor_l, ok_ebm_l):
             total += 1
-            g = extract_final_answer(gold)
-            if extract_final_answer(p_a) == g: a_correct += 1
-            if extract_final_answer(p_e) == g: e_correct += 1
-            if len(samples) < 3:
+            if ok_a: a_correct += 1
+            if ok_e: e_correct += 1
+            if len(samples) < 2:
                 samples.append((q[:80], gold, p_a, p_e))
     actor.train()
     diffusion.train()
-    n = max(total, 1)
+    n_t = max(total, 1)
     return {
-        "actor_acc": a_correct / n,
-        "ebm_acc":   e_correct / n,
-        "mse_z":     mse_sum / n,
-        "corr_z":    cos_sum / n,
-        "e_actor":   e_actor_sum / n,
-        "e_teacher": e_teacher_sum / n,
+        "actor_acc": a_correct / n_t,
+        "ebm_acc":   e_correct / n_t,
+        "mse_z":     mse_sum / n_t,
+        "corr_z":    cos_sum / n_t,
+        "e_actor":   e_actor_sum / n_t,
+        "e_teacher": e_teacher_sum / n_t,
         "samples":   samples,
         "n":         total,
     }
@@ -247,7 +271,7 @@ def main(argv=None):
     # ---- autoencoder (frozen) ----
     print(f"loading autoencoder: {args.model}")
     d_ae_arg = args.d_ae if args.d_ae > 0 else None
-    ae = FrozenT5Autoencoder(
+    ae = FrozenBartAutoencoder(
         model_name=args.model,
         k=args.k,
         pool_layers=args.pool_layers,
@@ -275,7 +299,8 @@ def main(argv=None):
         n_heads=args.ebm_heads,
         dim_ff_mult=args.ebm_ff_mult,
     ).to(args.device)
-    ebm.load_state_dict(torch.load(args.ebm_ckpt, map_location=args.device)["ebm"])
+    ebm_ckpt = torch.load(args.ebm_ckpt, map_location=args.device)
+    ebm.load_state_dict(ebm_ckpt["ebm"])
     ebm.eval()
     for p in ebm.parameters():
         p.requires_grad_(False)
@@ -289,6 +314,11 @@ def main(argv=None):
         envelope_sf=args.envelope_sf if args.envelope_sf > 0 else None,
     ).to(args.device)
     diffusion.eval()
+    if "latent_mu" in ebm_ckpt and "latent_sigma" in ebm_ckpt:
+        diffusion.set_latent_stats(
+            ebm_ckpt["latent_mu"].to(args.device),
+            ebm_ckpt["latent_sigma"].to(args.device),
+        )
 
     # ---- actor (trainable) ----
     actor = Actor(
@@ -303,15 +333,37 @@ def main(argv=None):
     print(f"actor params: {n_params:,}  (d_ae={d_diff}, K={args.k}, layers={args.actor_layers})")
 
     # ---- data ----
-    train_ds = GSM8KDataset("train", answer_mode=args.answer_mode)
-    test_ds = GSM8KDataset("test", answer_mode=args.answer_mode)
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate, num_workers=args.num_workers, drop_last=True,
+    print("loading datasets...")
+    train_ds = MBPPDataset(
+        split="train", config=args.mbpp_config, seed=args.seed,
     )
-    test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate, num_workers=args.num_workers,
+    print(f"  train: MBPP ({len(train_ds)} examples, config={args.mbpp_config})")
+
+    mbpp_test_ds = MBPPDataset(
+        split="test", config=args.mbpp_config,
+        max_samples=args.eval_n_examples, seed=args.seed,
+    )
+    he_test_ds = HumanEvalDataset(max_samples=args.eval_n_examples, seed=args.seed)
+    print(f"  eval: mbpp_test={len(mbpp_test_ds)}  humaneval={len(he_test_ds)}")
+
+    # Pre-tokenize question once — actor distillation only conditions on z_q,
+    # the answer text is unused at train time (teacher's z_final is the target).
+    print("pre-tokenizing train corpus (question)...")
+    train_ds = PreTokenizedDataset(
+        train_ds, ae.tokenizer,
+        max_q_length=args.max_q_length,
+        fields=("question",),
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=make_collate_pretokenized(ae.tokenizer.pad_token_id),
+        num_workers=args.num_workers,
+        pin_memory=(args.device.startswith("cuda")),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=(4 if args.num_workers > 0 else None),
+        drop_last=True,
     )
 
     opt = AdamW(actor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -330,9 +382,12 @@ def main(argv=None):
             batch = next(train_iter)
 
         # --- teacher rollout (no grad) ---
+        q_ids = batch["question_input_ids"].to(args.device, non_blocking=True)
+        q_mask = batch["question_attention_mask"].to(args.device, non_blocking=True)
         z_q, z_final = teacher_rollout(
             ae, diffusion, batch["question"], args.device,
             args.max_q_length, args.inner_steps, buffer,
+            q_input_ids=q_ids, q_attention_mask=q_mask,
         )
 
         # --- student one-shot regression ---
@@ -370,37 +425,50 @@ def main(argv=None):
             )
 
         if step % args.eval_every == 0 or step == args.steps:
-            ev = eval_actor(
-                ae, diffusion, ebm, actor, test_loader, args.device,
-                args.max_q_length, args.max_a_length, args.inner_steps, n_batches=5,
+            ev_mbpp = eval_actor_corpus(
+                ae, diffusion, ebm, actor, mbpp_test_ds, "mbpp", args.device,
+                args.max_q_length, args.max_a_length, args.inner_steps,
+                n_examples=args.eval_n_examples, batch_size=args.batch_size,
+            )
+            ev_he = eval_actor_corpus(
+                ae, diffusion, ebm, actor, he_test_ds, "humaneval", args.device,
+                args.max_q_length, args.max_a_length, args.inner_steps,
+                n_examples=args.eval_n_examples, batch_size=args.batch_size,
             )
             print(
-                f"  [eval n={ev['n']}] actor_acc={ev['actor_acc']:.3f}  "
-                f"ebm_acc(inner={args.inner_steps})={ev['ebm_acc']:.3f}  "
-                f"mse_z={ev['mse_z']:.3f}  corr_z={ev['corr_z']:+.3f}"
+                f"  [mbpp n={ev_mbpp['n']}] actor_pass={ev_mbpp['actor_acc']:.3f}  "
+                f"ebm_pass(inner={args.inner_steps})={ev_mbpp['ebm_acc']:.3f}  "
+                f"mse_z={ev_mbpp['mse_z']:.3f}  corr_z={ev_mbpp['corr_z']:+.3f}"
             )
             print(
-                f"  [energy] e_actor={ev['e_actor']:.2f}  e_teacher={ev['e_teacher']:.2f}  "
-                f"gap={ev['e_actor'] - ev['e_teacher']:+.2f}  "
-                f"(gap≈0 means actor is at the teacher's minimum)"
+                f"  [humaneval n={ev_he['n']}] actor_pass={ev_he['actor_acc']:.3f}  "
+                f"ebm_pass(inner={args.inner_steps})={ev_he['ebm_acc']:.3f}  "
+                f"mse_z={ev_he['mse_z']:.3f}  corr_z={ev_he['corr_z']:+.3f}"
+            )
+            print(
+                f"  [energy mbpp] e_actor={ev_mbpp['e_actor']:.2f}  e_teacher={ev_mbpp['e_teacher']:.2f}  "
+                f"gap={ev_mbpp['e_actor'] - ev_mbpp['e_teacher']:+.2f}"
             )
 
             def _snip(s, n=120):
                 s = s.replace("\n", " ⏎ ")
                 return s if len(s) <= n else s[:n] + "…"
-            for q, gold, p_a, p_e in ev["samples"]:
-                print(f"    Q: {q}")
-                print(f"      gold        : {extract_final_answer(gold)!r}")
-                print(f"      actor       : {extract_final_answer(p_a)!r:>10}  | {_snip(p_a)}")
-                print(f"      ebm(inner={args.inner_steps:>2}): {extract_final_answer(p_e)!r:>10}  | {_snip(p_e)}")
+            for name, ev in [("mbpp", ev_mbpp), ("humaneval", ev_he)]:
+                for q, gold, p_a, p_e in ev["samples"][:1]:
+                    print(f"    [{name}] Q: {_snip(q)}")
+                    print(f"      gold  : {_snip(gold)}")
+                    print(f"      actor : {_snip(p_a)}")
+                    print(f"      ebm   : {_snip(p_e)}")
 
             ck = {
                 "actor": actor.state_dict(),
                 "config": vars(args),
                 "step": step,
-                "actor_acc": ev["actor_acc"],
-                "ebm_acc": ev["ebm_acc"],
-                "mse_z": ev["mse_z"],
+                "mbpp_actor_pass": ev_mbpp["actor_acc"],
+                "mbpp_ebm_pass": ev_mbpp["ebm_acc"],
+                "humaneval_actor_pass": ev_he["actor_acc"],
+                "humaneval_ebm_pass": ev_he["ebm_acc"],
+                "mse_z_mbpp": ev_mbpp["mse_z"],
             }
             torch.save(ck, os.path.join(args.save_dir, f"actor_step{step}.pt"))
             torch.save(ck, os.path.join(args.save_dir, "actor_latest.pt"))

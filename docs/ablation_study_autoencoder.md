@@ -18,7 +18,7 @@ in which the Z is a latent learnable feature of the decoder network `D` output. 
 | 4000 | 2.4800 | 1.00e-04 |
 | 5000 | 2.1753 | 1.00e-04 |
 
-this is compared to seperated atten implementation
+this is compared to separated atten implementation
 
 $Z = Z + selfAtten(q=z, k=z, v=z)$
 

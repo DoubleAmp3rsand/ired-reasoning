@@ -2,7 +2,7 @@
 
 This is the "thinking module" of the gensis.md proposal — adapted directly from
 IRED's `GaussianDiffusion1D` (the matrix-addition / continuous variant) to live in
-the latent space defined by the frozen T5 encoder + AttentionPool.
+the latent space defined by the frozen BART encoder + AttentionPool.
 
 Key mechanisms (from gensis.md §10):
   - opt_step: inner-loop gradient descent on the energy with bad-step rejection
@@ -67,7 +67,7 @@ class GaussianLatentDiffusion(nn.Module):
         supervise_energy_landscape: bool = True,
         objective: str = "pred_noise",
         # Clamping. IRED's defaults (x_start_clamp=2, envelope_sf=2) assume data
-        # in roughly [-1, 1]. LayerNorm'd T5 latents have element-std ~1 so the
+        # in roughly [-1, 1]. The pool's LayerNorm'd latents have element-std ~1 so the
         # bulk lives in ~[-3, 3]; we relax x_start_clamp and disable the per-t
         # envelope clamp by default. Pass concrete floats to re-enable.
         x_start_clamp: float | None = 5.0,
@@ -79,6 +79,13 @@ class GaussianLatentDiffusion(nn.Module):
         # reliable estimate of the clean latent near the end of the schedule.
         decoder_aux_weight: float = 0.0,
         decoder_aux_t_max: int = 2,
+        # Random-negative anchor. When > 0, in addition to the mined hard
+        # negative, sample a pure N(0, I) latent as a negative and require
+        # E(real) + margin < E(rand) via softplus. Directly attacks the
+        # NCE-collapse mode where mined negatives drift into the same low-
+        # energy region as positives, leaving E(gold) ≈ E(random).
+        rand_neg_weight: float = 0.0,
+        rand_neg_margin: float = 1.0,
     ):
         super().__init__()
         self.model = model
@@ -92,6 +99,8 @@ class GaussianLatentDiffusion(nn.Module):
         self.envelope_sf = envelope_sf
         self.decoder_aux_weight = float(decoder_aux_weight)
         self.decoder_aux_t_max = int(decoder_aux_t_max)
+        self.rand_neg_weight = float(rand_neg_weight)
+        self.rand_neg_margin = float(rand_neg_margin)
         self._decoder_loss_fn: DecoderLossFn | None = None
 
         if beta_schedule == "linear":
@@ -138,6 +147,36 @@ class GaussianLatentDiffusion(nn.Module):
 
         # per-timestep step size for inner-loop optimization
         reg("opt_step_size_t", torch.full((timesteps,), float(opt_step_size)))
+
+        # Per-dim shift/scale to map AE-native latents → N(0, I)-like space
+        # the diffusion schedule was designed for. Default is identity so this
+        # is a no-op until set_latent_stats() is called.
+        d_last = latent_shape[-1]
+        reg("latent_mu", torch.zeros(d_last))
+        reg("latent_sigma", torch.ones(d_last))
+
+    def set_latent_stats(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
+        """Install the per-dim shift/scale for latent normalization.
+
+        Both `mu` and `sigma` must be 1-D tensors of length d_ae. They are
+        applied as z_norm = (z - mu) / sigma before any diffusion math, and
+        the inverse is applied to any latent that leaves the module (sampled
+        outputs, x0_hat fed to the decoder-aux callback).
+
+        Storing these as buffers means they ship with the checkpoint, so
+        sample.py automatically picks them up on load.
+        """
+        assert mu.shape == self.latent_mu.shape, (mu.shape, self.latent_mu.shape)
+        assert sigma.shape == self.latent_sigma.shape, (sigma.shape, self.latent_sigma.shape)
+        sigma = sigma.clamp(min=1e-6)
+        self.latent_mu.copy_(mu.to(self.latent_mu))
+        self.latent_sigma.copy_(sigma.to(self.latent_sigma))
+
+    def _normalize(self, z_native: torch.Tensor) -> torch.Tensor:
+        return (z_native - self.latent_mu) / self.latent_sigma
+
+    def _denormalize(self, z_norm: torch.Tensor) -> torch.Tensor:
+        return z_norm * self.latent_sigma + self.latent_mu
 
     def set_decoder_loss_fn(self, fn: DecoderLossFn | None) -> None:
         """Register a callback for the decoder-CE auxiliary. Must be set if
@@ -231,9 +270,14 @@ class GaussianLatentDiffusion(nn.Module):
         inner_steps: int = 5,
         show_tqdm: bool = False,
     ) -> torch.Tensor:
-        """Full inference: outer T DDPM steps, each followed by `inner_steps` of IRED refinement."""
+        """Full inference: outer T DDPM steps, each followed by `inner_steps` of IRED refinement.
+
+        Accepts and returns AE-native latents; normalization to/from the
+        diffusion-internal N(0, I) space is handled here.
+        """
         b = z_q.size(0)
         device = z_q.device
+        z_q = self._normalize(z_q)
         z = torch.randn((b, *self.latent_shape), device=device)
 
         iterator = reversed(range(self.num_timesteps))
@@ -250,7 +294,7 @@ class GaussianLatentDiffusion(nn.Module):
             batched_t = torch.full((b,), t, device=device, dtype=torch.long)
             z = self._clamp_envelope(z, batched_t)
 
-        return z
+        return self._denormalize(z)
 
     # ------------------------------------------------------------------
     # training loss: denoising MSE + (optional) NCE energy-landscape supervision
@@ -341,6 +385,21 @@ class GaussianLatentDiffusion(nn.Module):
             "e_fake": e_fake.mean().item(),
             "eps_scale": scale_ratio,
         }
+
+        # Random-negative anchor: force E(real) + margin < E(N(0,I)) at the
+        # same t as the NCE comparison. softplus(e_real - e_rand + margin) is
+        # a one-sided margin: zero gradient once the gap exceeds `margin`,
+        # full gradient when e_rand is anywhere near e_real.
+        if self.rand_neg_weight > 0:
+            z_rand = torch.randn_like(z_a)
+            e_rand = self.model(z_q, z_rand, t, return_energy=True)  # (B, 1)
+            loss_rand = F.softplus(
+                e_real - e_rand + self.rand_neg_margin
+            ).mean()
+            loss_total = loss_total + self.rand_neg_weight * loss_rand
+            stats["rand"] = loss_rand.item()
+            stats["e_rand"] = e_rand.mean().item()
+
         loss_total, stats = self._maybe_add_decoder_aux(
             loss_total, stats, z_t, eps_hat, t, gold_texts
         )
@@ -376,7 +435,9 @@ class GaussianLatentDiffusion(nn.Module):
             x0_hat = x0_hat.clamp(-bound, bound)
 
         idx = mask.nonzero(as_tuple=True)[0]
-        x0_sub = x0_hat[idx]
+        # x0_hat lives in normalized space; the decoder expects AE-native
+        # latents, so undo the shift+scale before computing the CE.
+        x0_sub = self._denormalize(x0_hat[idx])
         texts_sub = [gold_texts[i] for i in idx.tolist()]
         loss_dec = self._decoder_loss_fn(x0_sub, texts_sub)
 
@@ -387,4 +448,8 @@ class GaussianLatentDiffusion(nn.Module):
     def forward(self, z_q: torch.Tensor, z_a: torch.Tensor, gold_texts: list[str] | None = None):
         b = z_q.shape[0]
         t = torch.randint(0, self.num_timesteps, (b,), device=z_q.device).long()
+        # Caller passes AE-native latents; normalize at the boundary so all
+        # internal diffusion math operates on N(0, I)-shaped data.
+        z_q = self._normalize(z_q)
+        z_a = self._normalize(z_a)
         return self.p_losses(z_q, z_a, t, gold_texts=gold_texts)

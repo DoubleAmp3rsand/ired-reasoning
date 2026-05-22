@@ -296,10 +296,12 @@ So `--supervise-energy-landscape True` is **load-bearing** for this proposal, no
 
 ### 7.2 Latent MSE alone may not punish the right errors
 
-The training loss in §5.1 lives entirely in latent space: `MSE(ε̂, ε)` over the K·d latent entries, plus the NCE energy contrast. This is the LD4LG / Stable-Diffusion recipe and is what we use as the default. But it has a known weakness for short discriminative outputs like GSM8K's final-answer mode:
+The training loss in §5.1 lives entirely in latent space: `MSE(ε̂, ε)` over the K·d latent entries, plus the NCE energy contrast. This is the LD4LG / Stable-Diffusion recipe and is what we use as the default. But it has a known weakness any time decoded outputs have multiple near-isomorphic forms whose correctness flips on a small set of tokens:
 
-- The latent encoding of `"5"` and `"6"` may sit close in MSE distance while being maximally different in correctness.
-- The MSE objective treats every dimension of the latent equally; it has no way to "spend more budget" on the dimensions the decoder reads most.
+- Two MBPP solutions that differ only by `<` vs `<=` in a comparison, or by a `+1` boundary tweak in a slice, sit *very* close in MSE distance — a handful of token-positions in an otherwise-identical function — while being maximally different in correctness (one passes the assertions, the other doesn't).
+- The MSE objective treats every dimension of the latent equally; it has no way to "spend more budget" on the dimensions the decoder reads as the operator-bearing tokens.
+
+With the code corpora used in §9 (MBPP solutions ~50–200 tokens, HumanEval canonical bodies ~30–150 tokens) the answer manifold has enough volume that random noise rarely lands on a near-miss program by accident — so the auxiliary CE term is *less* load-bearing than it would be for short numeric answers. It still helps in the operator-flip regime where small surface edits flip test pass/fail. We keep it as an optional knob (`--decoder-aux-weight 0.1 --decoder-aux-t-max 2`) but don't ship it on by default.
 
 The decoder *does* know this distinction — its CE loss explicitly punishes producing the wrong token. So a natural augmentation is to mix in a small frozen-decoder CE term:
 
@@ -398,33 +400,47 @@ The next section is the smallest experiment that exercises all three stages on a
 
 Realistic single-GPU prototype to validate the core thesis.
 
-**Setup (as originally proposed):**
-- **Task:** GSM8K (grade-school math). Short numeric answers, clean correctness signal.
-- **LatentEnc/LatentDec:** `flan-t5-large`, frozen. Custom learned attention pool compresses encoder output to `K=32` latents.
-- **Energy net:** 4-layer transformer over `concat(z_q, z_t, time_embed)`. Scalar output via squared-sum of final layer (matching `models.py:211`).
-- **Diffusion:** `T=10` timesteps, `continuous=True` (matrix-addition variant of `GaussianDiffusion1D`).
+**Task choice — why code instead of math or token-CoT.** An earlier draft targeted GSM8K. The grade-school-math choice ran into a structural problem: GSM8K answers are 1–3 numeric tokens. The effective rank of the answer manifold is ~log₂(10⁴) ≈ 13 bits, so even with K=128 latents × d_model dimensions the diffusion model is fighting for crumbs of structured signal. The "reasoning *in* latent space" thesis (each inner step is a thinking step that refines a noisy answer-latent) is hard to test rigorously when there is so little structure for the latent to encode.
+
+A second draft targeted ProofWriter + BBH logical-deduction puzzles. That gave richer per-answer structure (50–150 token proof chains) but introduced a different problem: the *correctness-bearing portion* of the target is a 3-way verdict (True/False/Unknown), so the latent's structural budget is spent encoding boilerplate proof prose while the bit that determines accuracy is a one-token verdict the EBM can lose to MSE-noise. Worse, the proof chain is itself a token-CoT trace — so the EBM was being supervised to denoise toward the latent image of English-language reasoning, putting the prototype back in "latent-encoded token-CoT" territory and partially defeating §1.2's commitment that the decoder transduces rather than reasons.
+
+Code generation cleans up both issues at once. The target is a **structured artifact** (a Python function), not a writeup of how to solve the problem. The artifact has rich per-token variability — 50–200 tokens of identifiers, operators, control flow — so the latent manifold has volume and the EBM has room to refine. The decoder's job is genuinely transduction: Python's grammar is rigid enough that the frozen T5 decoder is not doing problem-solving when it emits tokens, just rendering. And correctness is verifiable by an **external** signal (`assert` statements + `python -c`), independent of the EBM's own `E` — which gives us the strongest possible test of §2's calibrated-quality-scalar claim: does the trained `E(z_q, z, 0)` correlate with whether the decoded code passes its tests?
+
+**Setup:**
+- **Task:** MBPP — Mostly Basic Python Problems (974 examples, full config; 374 train / 90 val / 500 test / 10 prompt). Each example has a natural-language description, a canonical Python solution, and ≥3 assert tests. Primary EBM-training corpus. **HumanEval** (164 problems) is held-out eval only; never seen during training. See `ired/data.py` for the loaders.
+- **AE pretraining corpus:** OpenWebText (broad natural language). The AE is deliberately **never** trained on MBPP or HumanEval — keeping the latent space free of EBM-training-distribution leakage preserves the §3.2 anchoring property. The known risk this raises is documented in Milestone 1 below: an OWT-only AE may not round-trip Python well, since OWT is text-heavy. If Milestone 1 fails, the recovery is to either (a) add a code slice to AE pretraining (e.g., a sample from The Stack), or (b) swap T5 for CodeT5.
+- **LatentEnc/LatentDec:** `flan-t5-base` (d_model=768), frozen. Learned `AttentionPool` (K=128 latents) + `ReconstructionNet`. See §7.3.
+- **Energy net:** 4-layer transformer over `concat(z_q, z_t, time_embed)`. Scalar energy via squared-sum of final layer.
+- **Diffusion:** `T=10` timesteps, `continuous=True`.
 - **Inner loop:** 5 steps with bad-step rejection.
-- **Loss:** denoising MSE + NCE with `λ=1`. Optional `--decoder-aux-weight 0.1 --decoder-aux-t-max 2` for a low-t frozen-decoder CE ablation (see §7.4).
+- **Loss:** denoising MSE + NCE with `λ=1`. Optional `--decoder-aux-weight 0.1 --decoder-aux-t-max 2` for a low-t frozen-decoder CE ablation (see §7.2).
+- **Verifier:** decoded code is written to a temp file and executed in a subprocess with a 5-second timeout. Pass = subprocess exits 0; fail = non-zero return code, timeout, or unparseable output. The verifier is *not* sandboxed; it runs benchmark code with the same privileges as the parent process — fine for offline eval on MBPP/HumanEval, never point it at adversarial input.
 
 **Practical defaults that survived first-run debugging (see §12):**
-- **Model size:** `flan-t5-base` (d_model=768) for faster iteration. `large` is a drop-in.
-- **Autoencoder architecture:** LD4LG-faithful — `AttentionPool` (Perceiver Resampler with combined `MHA(q=Z, kv=[Z;E(w)])`) + explicit `ReconstructionNet` (f_ψ). See §7.5 for the rationale and §12.6 for what goes wrong without the combined MHA. Default `d_ae = d_model`; set lower (Step 2) once Milestone 1 is converged to shrink the EBM's diffusion space.
-- **Pool/recon capacity:** `K=64, pool_layers=4, recon_layers=2` (~37M trainable AE params at d_model=768). The K=32 / 2-layer-pool / no-recon design plateaued at loss ~1.45.
-- **Answer mode:** `full` (the CoT ending in `#### N`), not `final` (just the number). With `K=32, d=768` the latent has ~24k DoF; a final-only answer carries ~60 bits, leaving the data manifold ~5 orders of magnitude smaller than the latent volume. The EBM can find the rough direction but can't precisely localize, and head magnitude inflates trying to compensate. Full mode also gives reasoning structure to denoise toward. Eval extracts `#### N` from decoded text rather than byte-exact matching.
-- **`max_a_length`:** `256` for full mode. Covers ~99% of GSM8K answers (p99=240, max=354). `128` (the previous default) truncates ~25% of the training set.
+- **Model size:** `flan-t5-base` (d_model=768) for faster iteration. `large` is a drop-in. CodeT5-base is the natural swap if the OWT-trained T5 fails Milestone 1 on code recon.
+- **Autoencoder architecture:** LD4LG-faithful — `AttentionPool` (Perceiver Resampler with shared LN + gated residuals OR the `decoder`-style separated self+cross attention) + explicit `ReconstructionNet` (f_ψ). See §7.3 for the rationale and §12.6 for what goes wrong with naïve combined-MHA. Default `d_ae = d_model`; set lower once Milestone 1 is converged to shrink the EBM's diffusion space.
+- **Pool/recon capacity:** `K=128, pool_layers=2–4, recon_layers=2`. K=128 gives ~2:1 compression on MBPP's typical ~100-token solution; K=32 (the GSM8K-era default) is undersized for code-shaped outputs.
+- **Answer target:** the full canonical solution code (MBPP `code` field — full `def`-block) or the full executable function `prompt + canonical_solution` (HumanEval). Both corpora share the "answer is a complete executable Python function" convention so the EBM sees uniform target shape. Per-example test fixtures are stored on the dataset record (`_test_script`) and used by `verify_code` at eval time. See `ired/data.py`.
+- **`max_q_length`:** `512` — HumanEval prompts (signature + long docstrings + I/O examples) can be long; MBPP descriptions are short but we keep the cap consistent.
+- **`max_a_length`:** `384` — MBPP solutions and HumanEval canonical bodies fit comfortably; the small bump from the ProofWriter-era `256` covers HumanEval's longer functions.
 - **β schedule:** `cosine`, not `linear`. Linear at T=10 saturates immediately after clamping (β=0.999 for 5 of 10 steps), giving the EBM almost no useful t spread.
-- **Weight decay:** `--weight-decay 0.01` on the EBM. **Load-bearing** — without it the head magnitude inflates ~100× during training, energies grow with it, and the relative NCE contrast collapses from ~2× to ~1.02× even though the NCE loss number looks fine.
+- **Weight decay:** `--weight-decay 0.01` on the EBM. **Load-bearing** — without it the head magnitude inflates ~100× during training and the relative NCE contrast collapses (§12.2).
 - **Clamps:** `x_start_clamp=5.0`, `envelope_sf=None`. IRED's hardcoded `(2, 2)` assume `[-1, 1]` data; LayerNorm'd T5 latents live in ~`[-3, 3]`.
-- **SDPA kernel:** force `SDPBackend.MATH` inside the EBM's attention — the fast kernels don't implement double-backward, which IRED's MSE-on-∇E requires.
-- **Monitoring (per training step):** `mse, nce, e_real, e_fake, eps_scale = ||ε̂|| / ||noise||`. Target `eps_scale ≈ 1.0`. Drift above 1 = head inflation; below 1 = under-prediction; either breaks DDPM sampling regardless of MSE.
-- **Monitoring (per eval):** `ae_recon_acc, ebm_acc(inner=N), ebm_acc(inner=0), mse_z, std_zs, corr_z`. `ae_recon_acc` separates Milestone-1 failures from EBM failures; `inner=0` vs `inner=N` isolates whether `opt_step` is helping or hurting; `std_zs/std_za` and `corr_z` localize whether the failure is magnitude inflation, direction misalignment, or both.
+- **SDPA kernel:** force `SDPBackend.MATH` inside the EBM's attention — fast kernels don't implement double-backward.
+- **Monitoring (per training step):** `mse, nce, e_real, e_fake, eps_scale = ||ε̂|| / ||noise||`. Target `eps_scale ≈ 1.0`.
+- **Monitoring (per eval):** `mbpp_pass(inner=N), mbpp_pass(inner=0), mbpp_ae_pass, humaneval_pass(inner=N), humaneval_pass(inner=0), humaneval_ae_pass, mse_z, std_zs, corr_z`. Per-corpus AE pass-rate separates Milestone-1 failures from EBM failures *per corpus* — important since HumanEval has longer prompts than MBPP and the AE may handle one better than the other.
 
 **Milestones:**
-1. **Autoencoder check** — confirm `LatentDec(Pool(LatentEnc(A)))` reproduces GSM8K answers. If accuracy < 95% in `final` mode (a strict floor on pool fidelity), redesign the pool/decoder before going further. For `full` mode the bar is final-answer extraction accuracy ≥ 90% — the CoT body needn't byte-match, only the `#### N` must come back. *(Final-mode benchmark on flan-t5-base + 2-layer pool + K=32: 98.8% on GSM8K-test.)*
-2. **Diffusion training** — train energy net to convergence on GSM8K train set. *Watch `eps_scale` and the `e_real/e_fake` ratio over training; either drifting is the early warning sign §12.2 describes.*
-3. **Test-time compute curve** — plot accuracy vs. `N_inner × T` and compare to AR-CoT at matched FLOPs.
+1. **Autoencoder check** — `LatentDec(Recon(Pool(LatentEnc(code))))` round-trips on the EBM-eval corpora *even though the AE was only trained on OpenWebText*. Bars:
+   - MBPP test pass-rate ≥ 80% (decode the canonical, run against `test_list`)
+   - HumanEval pass-rate ≥ 80% (decode prompt+canonical, run against `check`)
+   - OpenWebText held-out byte-exact recon ≥ 50% (sanity check that the AE works at all)
 
-**Decision rule:** if the diffusion curve is steeper than AR-CoT at matched compute, the thesis is validated. If it plateaus below AR-CoT, that's an informative negative result about smoothness of reasoning in latent space.
+   The code bars are lower than the ProofWriter-era 90% because Python tokens (especially identifiers and operators) are higher-entropy than English prose, and a single mis-rendered operator can flake a whole test. If the AE clears OWT but fails both code bars by a large margin, the OWT-trained latent space doesn't transfer to Python — the recovery is to either (a) add a small code slice to AE pretraining (a sample from The Stack), or (b) swap T5 for CodeT5-base, both of which break the strict "no EBM-corpus exposure" rule slightly but preserve the more important property that the AE was never trained on MBPP/HumanEval specifically.
+2. **Diffusion training** — train the energy net on MBPP. *Watch `eps_scale` and the `e_real/e_fake` ratio over training; either drifting is the §12.2 warning sign. Report `mbpp_pass(inner=N) - mbpp_pass(inner=0)` and the HumanEval equivalent: positive deltas mean iterative refinement is doing real work.* Additionally report Pearson correlation between `E(z_q, z, 0)` on the model's own samples and observed pass/fail — this is the §2 calibrated-scalar claim, and code execution gives us the cleanest external signal to test it against.
+3. **Test-time compute curve** — plot MBPP pass-rate and HumanEval pass-rate vs. `N_inner × T` and compare to AR-CoT at matched FLOPs (e.g., flan-t5-base CoT-prompted to write the function).
+
+**Decision rule:** if the diffusion curve is steeper than AR-CoT at matched compute, *and* the `inner=N` vs `inner=0` gap is positive and grows with N, the thesis is validated — iterative energy descent is performing genuine refinement on code generation. If accuracy plateaus below AR-CoT, or if `inner=N` and `inner=0` are indistinguishable, that's an informative negative about smoothness of reasoning in this latent space. A separate informative signal: if `E`–pass-rate correlation is high (>0.5), the calibrated-scalar claim holds even when accuracy is modest — which is what justifies using `E` as the gate in §5.4's adaptive inference.
 
 ---
 
@@ -440,7 +456,7 @@ Realistic single-GPU prototype to validate the core thesis.
 - Autoencoder quality bottleneck — most teams who tried latent-diffusion-for-text reported "the decoder is the limiting factor."
 - RL-on-AR-CoT (DeepSeek-R1, o1) is currently the empirical winner. Any diffusion-based reasoning system has to justify *not* using RL.
 - Reasoning may not be smooth in latent space. If correct reasoning traces are isolated discrete modes rather than connected regions, diffusion will struggle.
-- The decoder-as-transducer assumption only holds for constrained output formats. This prototype targets math; the approach is structurally restricted to domains (code, formal logic, structured planning) where linguistic rendering doesn't itself require reasoning. Open-ended natural language is outside scope — not a temporary limitation but a real one.
+- The decoder-as-transducer assumption only holds for constrained output formats. This prototype targets code generation; the approach is structurally restricted to domains (code, formal logic, structured planning) where linguistic rendering doesn't itself require reasoning. Open-ended natural language is outside scope — not a temporary limitation but a real one.
 - Collapsing the composite anchored cost (§3.3) to a single target-encoder term is a deliberate simplification. If the single anchor turns out to be gameable in the LLM-latent setting, additional anchors (world-model coherence, counterfactual stability, capacity bottleneck) have to be added — and the bad-step-rejection contract has to be re-checked under each addition.
 
 **Why try it anyway.** The architecture is clean, the prior work is encouraging, and even a clear negative result tells us something concrete about the geometry of reasoning in continuous space. Brains, by every available indication, do not reason in language — language regions are largely inactive during reasoning, verbalization happens at output. If artificial reasoning systems are ever to operate at the level of fluid cognition that biological systems exhibit, the substrate likely has to be representational rather than lexical. The current "latent reasoning" literature gestures at this without implementing it; this prototype is the smallest concrete step toward the system the framework actually demands. Feasible on a single GPU in roughly two weeks.

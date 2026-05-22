@@ -1,9 +1,10 @@
-"""Milestone 3 (gensis.md §8): test-time compute curve.
+"""Milestone 3 (gensis.md §9): test-time compute curve.
 
-Sweeps `inner_steps` ∈ {0, 1, 2, 5, 10} and reports exact-match accuracy. The
-"decision rule" in gensis: a steeper accuracy-vs-compute curve than AR-CoT at
-matched FLOPs validates the thesis; a plateau below is an informative negative
-about smoothness of reasoning in latent space.
+Sweeps `inner_steps` ∈ {0, 1, 2, 5, 10} and reports pass-rate on the chosen
+eval corpus (MBPP or HumanEval). The "decision rule" in gensis: a steeper
+pass-rate-vs-compute curve than AR-CoT at matched FLOPs validates the thesis;
+a plateau below is an informative negative about smoothness of reasoning in
+latent space.
 """
 from __future__ import annotations
 
@@ -11,20 +12,23 @@ import argparse
 import time
 
 import torch
-from torch.utils.data import DataLoader
 
-from ired.autoencoder import FrozenT5Autoencoder
-from ired.data import GSM8KDataset, collate, extract_final_answer
+from ired.autoencoder import FrozenBartAutoencoder
+from ired.data import (
+    HumanEvalDataset,
+    MBPPDataset,
+    verify_code,
+)
 from ired.diffusion import GaussianLatentDiffusion
 from ired.energy_net import DiffusionWrapper, EnergyTransformer
 
 
 def build_parser():
     p = argparse.ArgumentParser(description="Sample and measure test-time compute curve")
-    p.add_argument("--model", default="google/flan-t5-base")
+    p.add_argument("--model", default="facebook/bart-base")
     p.add_argument("--ae-ckpt", required=True)
     p.add_argument("--ebm-ckpt", required=True)
-    p.add_argument("--k", type=int, default=32)
+    p.add_argument("--k", type=int, default=128)
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
     p.add_argument("--pool-type", choices=["decoder", "resampler"], default="decoder",
@@ -40,30 +44,36 @@ def build_parser():
     p.add_argument("--inner-steps", type=int, nargs="+", default=[0, 1, 2, 5, 10])
     p.add_argument("--x-start-clamp", type=float, default=5.0)
     p.add_argument("--envelope-sf", type=float, default=-1.0)
-    p.add_argument("--answer-mode", choices=["final", "full"], default="full",
-                   help="Must match the AE+EBM training mode.")
+    p.add_argument("--eval-dataset", choices=["mbpp", "humaneval"], default="mbpp",
+                   help="Test corpus to sweep over.")
+    p.add_argument("--mbpp-config", choices=["full", "sanitized"], default="full")
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--n-batches", type=int, default=20)
-    p.add_argument("--max-q-length", type=int, default=256)
-    p.add_argument("--max-a-length", type=int, default=256)
+    p.add_argument("--n-examples", type=int, default=320,
+                   help="total test examples to score per inner_steps setting.")
+    p.add_argument("--max-q-length", type=int, default=512)
+    p.add_argument("--max-a-length", type=int, default=384)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num-workers", type=int, default=2)
     return p
 
 
 @torch.no_grad()
-def sample_accuracy(ae, diffusion, loader, device, max_q_length, max_a_length, inner_steps, n_batches):
+def sample_accuracy(ae, diffusion, dataset, dataset_name, device,
+                    max_q_length, max_a_length, inner_steps, n_examples, batch_size):
     correct = 0
     total = 0
-    for i, batch in enumerate(loader):
-        if i >= n_batches:
-            break
-        z_q = ae.encode_to_latents(batch["question"], device, max_length=max_q_length)
+    n = min(n_examples, len(dataset))
+    for start in range(0, n, batch_size):
+        batch_idx = list(range(start, min(start + batch_size, n)))
+        batch = [dataset[i] for i in batch_idx]
+        questions = [b["question"] for b in batch]
+
+        z_q = ae.encode_to_latents(questions, device, max_length=max_q_length)
         z = diffusion.sample(z_q, inner_steps=inner_steps)
         preds = ae.decode(z, max_length=max_a_length)
-        for p, a in zip(preds, batch["answer"]):
+        for ex, pred in zip(batch, preds):
             total += 1
-            if extract_final_answer(p) == extract_final_answer(a):
+            if verify_code(pred, ex):
                 correct += 1
     return correct / max(total, 1), total
 
@@ -72,7 +82,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     d_ae = args.d_ae if args.d_ae > 0 else None
-    ae = FrozenT5Autoencoder(
+    ae = FrozenBartAutoencoder(
         model_name=args.model,
         k=args.k,
         pool_layers=args.pool_layers,
@@ -98,7 +108,8 @@ def main(argv=None):
         n_heads=args.ebm_heads,
         dim_ff_mult=args.ebm_ff_mult,
     ).to(args.device)
-    ebm.load_state_dict(torch.load(args.ebm_ckpt, map_location=args.device)["ebm"])
+    ebm_ckpt = torch.load(args.ebm_ckpt, map_location=args.device)
+    ebm.load_state_dict(ebm_ckpt["ebm"])
     ebm.eval()
 
     wrapper = DiffusionWrapper(ebm).to(args.device)
@@ -111,21 +122,42 @@ def main(argv=None):
     ).to(args.device)
     diffusion.eval()
 
-    test_ds = GSM8KDataset("test", answer_mode=args.answer_mode)
-    loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate, num_workers=args.num_workers,
-    )
+    # Restore the per-dim latent normalization (LD4LG shift+scale). Missing
+    # stats = old checkpoint trained before normalization existed; fall back
+    # to identity and warn — sampling will be miscalibrated.
+    if "latent_mu" in ebm_ckpt and "latent_sigma" in ebm_ckpt:
+        diffusion.set_latent_stats(
+            ebm_ckpt["latent_mu"].to(args.device),
+            ebm_ckpt["latent_sigma"].to(args.device),
+        )
+        print(
+            f"loaded latent stats: |mu|_mean={ebm_ckpt['latent_mu'].abs().mean().item():.3f}  "
+            f"sigma_mean={ebm_ckpt['latent_sigma'].mean().item():.3f}"
+        )
+    else:
+        print(
+            "WARNING: ebm checkpoint has no latent_mu/sigma — sampling will use "
+            "identity normalization, which is likely miscalibrated."
+        )
+
+    if args.eval_dataset == "mbpp":
+        test_ds = MBPPDataset(
+            split="test", config=args.mbpp_config,
+            max_samples=args.n_examples, seed=args.seed,
+        )
+    else:
+        test_ds = HumanEvalDataset(max_samples=args.n_examples, seed=args.seed)
+    print(f"eval dataset: {args.eval_dataset} ({len(test_ds)} examples)")
 
     print(f"{'inner':>6}  {'acc':>6}  {'n':>5}  {'ebm_passes':>11}  {'time_s':>7}")
     for n_inner in args.inner_steps:
         t0 = time.time()
         acc, total = sample_accuracy(
-            ae, diffusion, loader, args.device,
-            args.max_q_length, args.max_a_length, n_inner, args.n_batches,
+            ae, diffusion, test_ds, args.eval_dataset, args.device,
+            args.max_q_length, args.max_a_length, n_inner,
+            args.n_examples, args.batch_size,
         )
         dt = time.time() - t0
-        # Per sample: T outer DDPM passes (1 fwd+bwd each) + T * n_inner inner passes
         ebm_passes = args.timesteps * (1 + n_inner)
         print(f"{n_inner:>6}  {acc:>.3f}  {total:>5}  {ebm_passes:>11}  {dt:>7.1f}")
 

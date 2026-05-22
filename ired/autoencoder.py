@@ -1,4 +1,9 @@
-"""Frozen T5 autoencoder with compression / reconstruction split.
+"""Frozen BART autoencoder with compression / reconstruction split.
+
+BART (byte-level BPE tokenizer) is used instead of T5 (SentencePiece) because
+T5's tokenizer normalizes `\\n`, `\\r`, and runs of spaces into a single space
+during encoding — fatal for code reconstruction where whitespace is
+load-bearing syntax. BART preserves every byte through encode/decode.
 
 Pipeline:
 
@@ -39,7 +44,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, T5ForConditionalGeneration
+from transformers import AutoTokenizer, BartForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
 
@@ -207,10 +212,11 @@ class ReconstructionNet(nn.Module):
     swamps it and the frozen decoder falls back to unigram statistics. The
     optimizer then gradually grows non-zero residuals as training proceeds.
 
-    **No final LayerNorm.** The frozen T5 decoder was trained on RMSNorm'd
-    encoder hidden states; adding a third LayerNorm on top (pool's final LN
-    + recon's internal LNs already happened) over-normalizes and squashes
-    the magnitude information the decoder cross-attention needs.
+    **No final LayerNorm.** The frozen decoder's cross-attention needs the
+    magnitude information in its key/value memory. Pool already applies a
+    final LayerNorm and recon's internal norm_first blocks normalize
+    per-token; stacking a third trailing LN over-normalizes and squashes
+    that magnitude signal.
     """
 
     def __init__(
@@ -256,13 +262,16 @@ class ReconstructionNet(nn.Module):
         return x
 
 
-class FrozenT5Autoencoder(nn.Module):
-    """T5 encoder + decoder, frozen; AttentionPool + ReconstructionNet, trainable.
+class FrozenBartAutoencoder(nn.Module):
+    """BART encoder + decoder, frozen; AttentionPool + ReconstructionNet, trainable.
+
+    BART is used over T5 because its byte-level BPE tokenizer preserves all
+    whitespace (newlines, tabs, indentation) — required for code reconstruction.
 
     Public API:
       encode_to_latents(texts) -> (B, K, d_ae)              # diffusion-space
       decode_loss(z, target_texts) -> scalar CE loss        # for AE training
-      decode(z) -> list[str]                                # greedy from latents
+      decode(z, num_beams=1) -> list[str]                   # generate from latents
 
     Set `d_ae < d_model` to make the EBM diffuse in a smaller space; the
     reconstruction network up-projects back to d_model for the frozen decoder.
@@ -270,7 +279,7 @@ class FrozenT5Autoencoder(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "google/flan-t5-base",
+        model_name: str = "facebook/bart-base",
         k: int = 32,
         pool_layers: int = 2,
         pool_heads: int = 8,
@@ -278,16 +287,14 @@ class FrozenT5Autoencoder(nn.Module):
         d_ae: int | None = None,
         recon_layers: int = 2,
         recon_heads: int = 8,
-        use_recon: bool = True,
     ):
         super().__init__()
         self.model_name = model_name
-        self.t5 = T5ForConditionalGeneration.from_pretrained(model_name)
+        self.bart = BartForConditionalGeneration.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.d_model = self.t5.config.d_model
+        self.d_model = self.bart.config.d_model
         self.d_ae = d_ae if d_ae is not None else self.d_model
         self.k = k
-        self.use_recon = use_recon
         self.pool_type = pool_type
 
         self.pool = AttentionPool(
@@ -298,38 +305,27 @@ class FrozenT5Autoencoder(nn.Module):
             d_ae=self.d_ae,
             pool_type=pool_type,
         )
-        if self.use_recon:
-            self.recon: nn.Module = ReconstructionNet(
-                d_ae=self.d_ae,
-                d_LM=self.d_model,
-                n_layers=recon_layers,
-                n_heads=recon_heads,
-            )
-        else:
-            # Diagnostic fallback: pool output goes straight to T5 decoder. Only
-            # valid when d_ae == d_model (decoder needs d_LM-shaped input).
-            if self.d_ae != self.d_model:
-                raise ValueError(
-                    f"use_recon=False requires d_ae == d_model "
-                    f"(got d_ae={self.d_ae}, d_model={self.d_model}). "
-                    "Without recon there's no up-projection back to d_model."
-                )
-            self.recon = nn.Identity()
+        self.recon = ReconstructionNet(
+            d_ae=self.d_ae,
+            d_LM=self.d_model,
+            n_layers=recon_layers,
+            n_heads=recon_heads,
+        )
 
-        self.freeze_t5()
+        self.freeze_bart()
 
     # ------------------------------------------------------------------
     # freezing
     # ------------------------------------------------------------------
-    def freeze_t5(self) -> None:
-        for p in self.t5.parameters():
+    def freeze_bart(self) -> None:
+        for p in self.bart.parameters():
             p.requires_grad_(False)
-        self.t5.eval()
+        self.bart.eval()
 
     def train(self, mode: bool = True):
-        # Pool + recon toggle to train mode; T5 stays in eval.
+        # Pool + recon toggle to train mode; BART stays in eval.
         super().train(mode)
-        self.t5.eval()
+        self.bart.eval()
         return self
 
     # ------------------------------------------------------------------
@@ -345,19 +341,40 @@ class FrozenT5Autoencoder(nn.Module):
         ).to(device)
 
     @torch.no_grad()
-    def _t5_encode(self, texts, device, max_length):
+    def _bart_encode(self, texts, device, max_length):
         enc = self._tokenize(texts, device, max_length)
-        out = self.t5.encoder(input_ids=enc.input_ids, attention_mask=enc.attention_mask)
+        out = self.bart.get_encoder()(
+            input_ids=enc.input_ids,
+            attention_mask=enc.attention_mask,
+        )
         return out.last_hidden_state, enc.attention_mask
 
     def encode_to_latents(self, texts, device, max_length: int = 128) -> torch.Tensor:
         """Encode text → (B, K, d_ae) via frozen encoder + trainable pool."""
-        enc_hidden, enc_mask = self._t5_encode(texts, device, max_length=max_length)
+        enc_hidden, enc_mask = self._bart_encode(texts, device, max_length=max_length)
         z = self.pool(enc_hidden, enc_mask)
         return z
 
+    def encode_to_latents_from_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pre-tokenized variant of `encode_to_latents`. Same forward path as
+        the text-based call but skips the main-thread tokenizer step — feed
+        ids straight from `PreTokenizedDataset` + `collate_pretokenized`.
+        Pool weights still receive gradients; the BART encoder stays frozen.
+        """
+        with torch.no_grad():
+            out = self.bart.get_encoder()(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+        z = self.pool(out.last_hidden_state, attention_mask)
+        return z
+
     # ------------------------------------------------------------------
-    # decoding: training loss + greedy generation
+    # decoding: training loss + generation (greedy or beam)
     # ------------------------------------------------------------------
     def _latents_to_decoder_input(self, z: torch.Tensor) -> torch.Tensor:
         """Apply f_ψ to map diffusion-space latents back to decoder-input shape."""
@@ -370,7 +387,7 @@ class FrozenT5Autoencoder(nn.Module):
         device,
         max_length: int = 128,
     ) -> torch.Tensor:
-        """T5 CE loss. `z` is in diffusion space (B, K, d_ae); recon shapes it
+        """BART CE loss. `z` is in diffusion space (B, K, d_ae); recon shapes it
         to (B, K, d_model) before the frozen decoder reads it."""
         z_dec = self._latents_to_decoder_input(z)                   # (B, K, d_model)
 
@@ -380,7 +397,26 @@ class FrozenT5Autoencoder(nn.Module):
 
         enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
         encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
-        out = self.t5(
+        out = self.bart(
+            encoder_outputs=encoder_outputs,
+            attention_mask=enc_attn,
+            labels=labels,
+        )
+        return out.loss
+
+    def decode_loss_from_ids(
+        self,
+        z: torch.Tensor,
+        label_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pre-tokenized variant of `decode_loss`. `label_ids` is the raw
+        tokenizer output (pad positions masked out internally with -100)."""
+        z_dec = self._latents_to_decoder_input(z)
+        labels = label_ids.clone()
+        labels[labels == self.tokenizer.pad_token_id] = -100
+        enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
+        encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
+        out = self.bart(
             encoder_outputs=encoder_outputs,
             attention_mask=enc_attn,
             labels=labels,
@@ -388,62 +424,82 @@ class FrozenT5Autoencoder(nn.Module):
         return out.loss
 
     @torch.no_grad()
-    def decode(self, z: torch.Tensor, max_length: int = 128) -> list[str]:
-        """Greedy decoding from continuous latents using KV cache. `z` is in
-        diffusion space (B, K, d_ae); recon expands to (B, K, d_model)."""
-        self.t5.eval()
+    def decode_loss_per_example(
+        self,
+        z: torch.Tensor,
+        target_texts,
+        device,
+        max_length: int = 128,
+    ) -> torch.Tensor:
+        """Per-example teacher-forced CE — returns shape (B,).
+
+        Same forward pass as `decode_loss` but reduces independently per
+        example, so per-example CE can be paired with per-example pass/fail
+        for the exposure-bias-gap diagnostic (see docs/exposure_bias.md).
+        Pad positions are excluded from each example's mean.
+        """
         z_dec = self._latents_to_decoder_input(z)
-        b = z_dec.size(0)
-        device = z_dec.device
+        target_enc = self._tokenize(target_texts, device, max_length)
+        labels = target_enc.input_ids.clone()
+        pad_mask = (labels == self.tokenizer.pad_token_id)
+        labels[pad_mask] = -100
 
-        enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=device)
+        enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
         encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
+        out = self.bart(
+            encoder_outputs=encoder_outputs,
+            attention_mask=enc_attn,
+            labels=labels,
+        )
+        logits = out.logits  # (B, L, V); BART shifts labels internally
+        B, L, V = logits.shape
+        ce = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, V),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape(B, L)
+        valid = (~pad_mask).float()
+        return (ce * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
 
-        start_id = self.t5.config.decoder_start_token_id
-        pad_id = self.tokenizer.pad_token_id
-        eos_id = self.tokenizer.eos_token_id
-
-        decoder_ids = torch.full((b, 1), start_id, dtype=torch.long, device=device)
-        finished = torch.zeros(b, dtype=torch.bool, device=device)
-        past = None
-
-        for _ in range(max_length):
-            step_input = decoder_ids if past is None else decoder_ids[:, -1:]
-            out = self.t5(
-                encoder_outputs=encoder_outputs,
-                attention_mask=enc_attn,
-                decoder_input_ids=step_input,
-                past_key_values=past,
-                use_cache=True,
-            )
-            past = out.past_key_values
-            next_tok = out.logits[:, -1].argmax(-1)
-            next_tok = torch.where(finished, torch.full_like(next_tok, pad_id), next_tok)
-            decoder_ids = torch.cat([decoder_ids, next_tok[:, None]], dim=1)
-            finished = finished | (next_tok == eos_id)
-            if finished.all():
-                break
-
-        return self.tokenizer.batch_decode(decoder_ids, skip_special_tokens=True)
+    @torch.no_grad()
+    def decode(
+        self,
+        z: torch.Tensor,
+        max_length: int = 128,
+        num_beams: int = 1,
+    ) -> list[str]:
+        """Decode from continuous latents. `z` is in diffusion space (B, K, d_ae);
+        recon expands to (B, K, d_model). `num_beams=1` is greedy; >1 enables
+        beam search, which usually lifts code pass-rate when per-token loss is
+        in the 0.2–1.0 nat range (right token often #2/#3, not #1)."""
+        self.bart.eval()
+        z_dec = self._latents_to_decoder_input(z)
+        enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
+        encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
+        out_ids = self.bart.generate(
+            encoder_outputs=encoder_outputs,
+            attention_mask=enc_attn,
+            max_length=max_length,
+            num_beams=num_beams,
+            early_stopping=(num_beams > 1),
+        )
+        return self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
 
     # ------------------------------------------------------------------
     # checkpoint helpers
     # ------------------------------------------------------------------
     def trainable_parameters(self):
-        params = list(self.pool.parameters())
-        if self.use_recon:
-            params += list(self.recon.parameters())
-        return params
+        return list(self.pool.parameters()) + list(self.recon.parameters())
 
     def state_dict_ae(self) -> dict:
-        """Save format: {pool, recon, d_ae, use_recon, pool_type}. Both modules
-        go together because they were trained jointly and only make sense as
-        a pair. When use_recon=False, the recon entry is None."""
+        """Save format: {pool, recon, d_ae, pool_type}. Both modules go
+        together because they were trained jointly and only make sense as
+        a pair."""
         return {
             "pool":      self.pool.state_dict(),
-            "recon":     self.recon.state_dict() if self.use_recon else None,
+            "recon":     self.recon.state_dict(),
             "d_ae":      self.d_ae,
-            "use_recon": self.use_recon,
             "pool_type": self.pool_type,
         }
 
@@ -454,12 +510,6 @@ class FrozenT5Autoencoder(nn.Module):
                 f"checkpoint has d_ae={saved_d_ae} but this AE was built with "
                 f"d_ae={self.d_ae}. Construct with matching d_ae and retry."
             )
-        saved_use_recon = state_dict.get("use_recon", True)
-        if saved_use_recon != self.use_recon:
-            raise ValueError(
-                f"checkpoint has use_recon={saved_use_recon} but this AE was "
-                f"built with use_recon={self.use_recon}. Construct to match."
-            )
         # Default to "decoder" for back-compat with pre-pool_type checkpoints.
         saved_pool_type = state_dict.get("pool_type", "decoder")
         if saved_pool_type != self.pool_type:
@@ -468,5 +518,4 @@ class FrozenT5Autoencoder(nn.Module):
                 f"built with pool_type={self.pool_type!r}. Construct to match."
             )
         self.pool.load_state_dict(state_dict["pool"])
-        if self.use_recon:
-            self.recon.load_state_dict(state_dict["recon"])
+        self.recon.load_state_dict(state_dict["recon"])
