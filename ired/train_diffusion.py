@@ -36,11 +36,36 @@ from ired.energy_net import DiffusionWrapper, EnergyTransformer
 from ired.tui import make_reporter
 
 
+def _resolve_ckpt_path(spec: str) -> str:
+    """Resolve a checkpoint spec to a local file path.
+
+    Accepts a local path (returned unchanged) or
+    'hf://<org>/<repo>[@<revision>]/<filename>', which is downloaded via
+    huggingface_hub.hf_hub_download and the cached path returned.
+    """
+    if not spec.startswith("hf://"):
+        return spec
+    from huggingface_hub import hf_hub_download
+    parts = spec[len("hf://"):].split("/", 2)
+    if len(parts) < 3:
+        raise ValueError(
+            f"hf:// spec must be 'hf://<org>/<repo>[@<revision>]/<filename>', got: {spec}"
+        )
+    org, repo_or_rev, filename = parts
+    revision = None
+    if "@" in repo_or_rev:
+        repo_or_rev, revision = repo_or_rev.split("@", 1)
+    return hf_hub_download(repo_id=f"{org}/{repo_or_rev}", filename=filename, revision=revision)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Train IRED energy network in latent space")
     # autoencoder
     p.add_argument("--model", default="facebook/bart-base")
-    p.add_argument("--ae-ckpt", required=True, help="AE checkpoint from train_autoencoder")
+    p.add_argument("--ae-ckpt", required=True,
+                   help="AE checkpoint from train_autoencoder. Local path, or "
+                        "'hf://<org>/<repo>[@<revision>]/<filename>' to pull from "
+                        "the HuggingFace Hub.")
     p.add_argument("--k", type=int, default=128, help="Must match the AE checkpoint's k.")
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
@@ -117,9 +142,17 @@ def build_parser():
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--save-dir", default="checkpoints/ebm")
     p.add_argument("--resume", default=None,
-                   help="path to an EBM checkpoint to resume from. Restores ebm "
-                        "weights, optimizer state, latent stats, and step "
-                        "counter; skips the one-shot latent-stats recompute.")
+                   help="EBM checkpoint to resume from. Local path, or "
+                        "'hf://<org>/<repo>[@<revision>]/<filename>' to pull from "
+                        "the HuggingFace Hub. Restores ebm weights, optimizer "
+                        "state, latent stats, and step counter; skips the "
+                        "one-shot latent-stats recompute.")
+    p.add_argument("--push-to-hub", default=None,
+                   help="if set (e.g. 'user/repo'), upload ebm_latest.pt to this "
+                        "HuggingFace Hub repo when training finishes. Creates the "
+                        "repo if missing.")
+    p.add_argument("--hub-private", action="store_true",
+                   help="create the --push-to-hub repo as private if it doesn't exist yet.")
     p.add_argument("--max-q-length", type=int, default=512,
                    help="HumanEval prompts (signature + long docstrings) can be long.")
     p.add_argument("--max-a-length", type=int, default=384,
@@ -274,7 +307,10 @@ def main(argv=None):
             recon_layers=args.recon_layers,
             recon_heads=args.recon_heads,
         ).to(args.device)
-        ckpt = torch.load(args.ae_ckpt, map_location=args.device)
+        ae_ckpt_path = _resolve_ckpt_path(args.ae_ckpt)
+        if ae_ckpt_path != args.ae_ckpt:
+            r.log(f"  pulled AE checkpoint from HF Hub → {ae_ckpt_path}")
+        ckpt = torch.load(ae_ckpt_path, map_location=args.device)
         if "ae" in ckpt:
             ae.load_ae(ckpt["ae"])
         else:
@@ -376,8 +412,11 @@ def main(argv=None):
 
         start_step = 0
         if args.resume is not None:
+            resume_path = _resolve_ckpt_path(args.resume)
             r.log(f"resuming from {args.resume}")
-            rckpt = torch.load(args.resume, map_location=args.device)
+            if resume_path != args.resume:
+                r.log(f"  pulled resume checkpoint from HF Hub → {resume_path}")
+            rckpt = torch.load(resume_path, map_location=args.device)
             ebm.load_state_dict(rckpt["ebm"])
             diffusion.set_latent_stats(
                 rckpt["latent_mu"].to(args.device),
@@ -558,6 +597,18 @@ def main(argv=None):
                 }
                 torch.save(ck, os.path.join(args.save_dir, f"ebm_step{step}.pt"))
                 torch.save(ck, os.path.join(args.save_dir, "ebm_latest.pt"))
+
+        if args.push_to_hub:
+            from huggingface_hub import HfApi, create_repo
+            latest = os.path.join(args.save_dir, "ebm_latest.pt")
+            r.log(f"pushing {latest} → https://huggingface.co/{args.push_to_hub}")
+            create_repo(args.push_to_hub, private=args.hub_private, exist_ok=True)
+            HfApi().upload_file(
+                path_or_fileobj=latest,
+                path_in_repo="ebm_latest.pt",
+                repo_id=args.push_to_hub,
+            )
+            r.log(f"upload complete: https://huggingface.co/{args.push_to_hub}/blob/main/ebm_latest.pt")
 
 
 if __name__ == "__main__":
