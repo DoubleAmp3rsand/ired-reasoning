@@ -62,10 +62,12 @@ def build_parser():
     p = argparse.ArgumentParser(description="Train IRED energy network in latent space")
     # autoencoder
     p.add_argument("--model", default="facebook/bart-base")
-    p.add_argument("--ae-ckpt", required=True,
+    p.add_argument("--ae-ckpt",
+                   default="hf://roy-W/ired-reasoning/checkpoints/ae_conv_norm_copy2/ae_latest.pt",
                    help="AE checkpoint from train_autoencoder. Local path, or "
                         "'hf://<org>/<repo>[@<revision>]/<filename>' to pull from "
-                        "the HuggingFace Hub.")
+                        "the HuggingFace Hub. "
+                        "Defaults to roy-W/ired-reasoning checkpoints/ae_conv_norm_copy2/ae_latest.pt.")
     p.add_argument("--k", type=int, default=128, help="Must match the AE checkpoint's k.")
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
