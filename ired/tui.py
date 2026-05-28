@@ -123,7 +123,7 @@ class TUIReporter(Reporter):
         self._live = Live(
             self._layout,
             console=self._console,
-            refresh_per_second=8,
+            refresh_per_second=0.5,
             screen=False,
             transient=False,
         )
@@ -165,8 +165,9 @@ class TUIReporter(Reporter):
         if not force and (self._refresh_tick % self._refresh_every) != 0:
             return
         w, h = self._console.size
-        graph_h = max(8, (h - 5) * 2 // 5)
-        graph_w = max(40, w // 2 - 4)
+        # Cap graph dimensions so they don't hog the terminal at large sizes.
+        graph_h = min(14, max(6, (h - 5) * 2 // 5))
+        graph_w = min(60, max(40, w // 2 - 4))
 
         self._layout["status"].update(
             Panel(Text(self._status or self._title, style="bold cyan"), title=self._title)
@@ -231,8 +232,9 @@ class TUIReporter(Reporter):
         # scroll on its own; rendering more lines than the height just hides
         # the most recent (most important) ones above the fold.
         _, h = self._console.size
-        # status (3) + graphs (2/5) + log panel chrome (2) → leave the rest.
-        log_h = max(5, h - 3 - max(8, (h - 5) * 2 // 5) - 2)
+        # status (3) + capped graph_h + log panel chrome (2) → leave the rest.
+        graph_h = min(14, max(6, (h - 5) * 2 // 5))
+        log_h = max(5, h - 3 - graph_h - 2)
         tail = list(self._log)[-log_h:]
         body = Text("\n".join(tail) if tail else "(no log yet)", style="white")
         return Panel(body, title=f"log ({len(self._log)} lines)")

@@ -43,7 +43,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from ired.actor import Actor
-from ired.autoencoder import FrozenBartAutoencoder
+from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
     HumanEvalDataset,
     MBPPDataset,
@@ -51,8 +51,8 @@ from ired.data import (
     make_collate_pretokenized,
     verify_code_batch,
 )
-from ired.diffusion import GaussianLatentDiffusion
-from ired.energy_net import DiffusionWrapper, EnergyTransformer
+from ired.model.diffusion import GaussianLatentDiffusion
+from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
 
 
 def build_parser():

@@ -30,13 +30,26 @@ import math
 import os
 import time
 
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
+try:
+    from huggingface_hub import HfApi, create_repo
+    _has_hf_hub = True
+except ImportError:
+    HfApi = None  # type: ignore
+    create_repo = None  # type: ignore
+    _has_hf_hub = False
+
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torchmetrics.text import CharErrorRate
 
-from ired.autoencoder import FrozenBartAutoencoder
+from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
     CodeSearchNetDataset,
     HumanEvalDataset,
@@ -60,10 +73,22 @@ def build_parser():
                         "or raise --grad-accum-steps to fit memory.")
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
-    p.add_argument("--pool-type", choices=["decoder", "resampler"], default="decoder",
+    p.add_argument("--pool-type", choices=["decoder", "resampler", "conv"], default="decoder",
                    help="'decoder' = nn.TransformerDecoderLayer (separated self+cross attn). "
                         "'resampler' = Flamingo-style combined-MHA Perceiver Resampler "
-                        "with shared LN + gated residuals (LD4LG-faithful, identity at init).")
+                        "with shared LN + gated residuals (LD4LG-faithful, identity at init). "
+                        "'conv' = depthwise-separable 1-D conv scan + adaptive pool to K + "
+                        "self-attention encoder (1-D kernel scans the input tensor).")
+    p.add_argument("--use-copy", action="store_true",
+                   help="add a pointer-generator 'point generator' head that lets the "
+                        "decoder copy tokens from the source. Trains via NLL under the "
+                        "copy-augmented distribution; helps verbatim code reconstruction.")
+    p.add_argument("--unfreeze-decoder", action="store_true",
+                   help="fine-tune the BART decoder (and tied LM head) jointly with the "
+                        "pool/recon. The encoder stays frozen. Decoder weights are saved "
+                        "in the checkpoint under the 'decoder' key.")
+    p.add_argument("--decoder-lr", type=float, default=1e-5,
+                   help="separate (usually smaller) LR for the unfrozen decoder params.")
     p.add_argument("--d-ae", type=int, default=-1,
                    help="diffusion-space latent dimension (LD4LG d_ae). "
                         "-1 (default) = d_model (no down-projection); "
@@ -143,18 +168,35 @@ def build_parser():
                    help="render training output as a Rich+plotext TUI "
                         "(graphs + scrolling log). Off by default so log "
                         "redirection / notebooks keep plain prints.")
+    p.add_argument("--config", default=None,
+                   help="path to a YAML config file. Values become defaults; "
+                        "CLI flags override them. Requires PyYAML (`pip install pyyaml`).")
+    p.add_argument("--push-to-hub", action="store_true",
+                   help="push the final AE checkpoint to HuggingFace Hub after training.")
+    p.add_argument("--hub-repo", default=None,
+                   help="HuggingFace Hub repo id, e.g. 'username/ae-conv-pg'. "
+                        "Required when --push-to-hub is set.")
+    p.add_argument("--hub-token", default=None,
+                   help="HF API token. Defaults to the HF_TOKEN env var.")
+    p.add_argument("--hub-private", action="store_true",
+                   help="create the HF Hub repo as private.")
     return p
 
 
-def build_param_groups(ae, weight_decay: float):
+def build_param_groups(ae, weight_decay: float, decoder_lr: float | None = None):
     """Split trainable params into decay / no-decay groups.
 
     No-decay: 1-D tensors (LayerNorm gains, biases, the Flamingo gated `alpha_*`
     scalars) plus the learnable `queries`. WD on these is harmful — it pulls
     `alpha` away from the values the optimizer is trying to grow, shrinks LN
     gains, and decays the pool's query embeddings toward zero.
+
+    When the BART decoder is unfrozen (`decoder_lr` given), its params get their
+    own decay / no-decay groups at the smaller `decoder_lr` so fine-tuning a
+    pretrained decoder doesn't move at the pool's-from-scratch learning rate.
     """
     decay, no_decay = [], []
+    dec_decay, dec_no_decay = [], []
     seen = set()
     for name, p in ae.named_parameters():
         if not p.requires_grad or id(p) in seen:
@@ -164,14 +206,22 @@ def build_param_groups(ae, weight_decay: float):
         is_alpha = "alpha_" in name
         is_bias = name.endswith(".bias")
         is_1d = p.ndim <= 1
-        if is_query or is_alpha or is_bias or is_1d:
-            no_decay.append(p)
+        no_wd = is_query or is_alpha or is_bias or is_1d
+        is_decoder = name.startswith("bart.")
+        if is_decoder:
+            (dec_no_decay if no_wd else dec_decay).append(p)
         else:
-            decay.append(p)
-    return [
+            (no_decay if no_wd else decay).append(p)
+    groups = [
         {"params": decay,    "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+    if decoder_lr is not None and (dec_decay or dec_no_decay):
+        groups += [
+            {"params": dec_decay,    "weight_decay": weight_decay, "lr": decoder_lr},
+            {"params": dec_no_decay, "weight_decay": 0.0,          "lr": decoder_lr},
+        ]
+    return groups
 
 
 @torch.no_grad()
@@ -203,7 +253,8 @@ def eval_reconstruction(ae, dataset, mode, device, max_a_length,
         z = ae.encode_to_latents(gold, device, max_length=max_a_length)
         loss = ae.decode_loss(z, gold, device, max_length=max_a_length)
         losses.append(loss.item())
-        preds = ae.decode(z, max_length=max_a_length, num_beams=num_beams)
+        # When the AE has a point generator, let it copy from the gold source.
+        preds = ae.decode(z, max_length=max_a_length, num_beams=num_beams, src_texts=gold)
         # Run all subprocess verifications for this batch in parallel — each
         # call forks `python`; threads wait on them concurrently.
         if mode == "code":
@@ -233,8 +284,123 @@ def eval_reconstruction(ae, dataset, mode, device, max_a_length,
     }
 
 
+def _push_checkpoint_to_hub(
+    ae: FrozenBartAutoencoder,
+    repo_id: str,
+    save_dir: str,
+    step: int,
+    token: str | None = None,
+    private: bool = False,
+    log_fn=print,
+) -> None:
+    """Push the final AE checkpoint + config to HuggingFace Hub.
+
+    Uploads:
+      - ae_checkpoint.pt        full checkpoint (torch.save format)
+      - config.json             FrozenBartAutoencoder constructor args
+      - model_card.md           auto-generated model card
+    """
+    import json
+
+    token = token or os.environ.get("HF_TOKEN")
+    api = HfApi()
+
+    # Create or reuse the repo.
+    try:
+        create_repo(repo_id, token=token, private=private, exist_ok=True)
+    except Exception as e:
+        log_fn(f"  warning: create_repo failed ({e}); continuing with upload")
+
+    # Build a serializable config so anyone can reconstruct the AE.
+    ae_config = {
+        "model_name": ae.model_name,
+        "k": ae.k,
+        "pool_layers": ae.pool.attn.num_layers if hasattr(ae.pool, "attn") and hasattr(ae.pool.attn, "num_layers") else None,
+        "pool_heads": None,  # not stored, fill manually if needed
+        "pool_type": ae.pool_type,
+        "d_ae": ae.d_ae,
+        "recon_layers": len(ae.recon.layers.layers),
+        "recon_heads": None,
+        "use_copy": ae.use_copy,
+        "train_decoder": ae.train_decoder,
+    }
+    config_path = os.path.join(save_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(ae_config, f, indent=2)
+
+    # Save a standalone checkpoint.
+    ckpt_path = os.path.join(save_dir, "ae_checkpoint.pt")
+    torch.save({"ae": ae.state_dict_ae(), "config": ae_config, "step": step}, ckpt_path)
+
+    # Model card.
+    card = (
+        "---\n"
+        f"library_name: ired\n"
+        f"tags:\n"
+        f"- autoencoder\n"
+        f"- bart\n"
+        f"- latent-diffusion\n"
+        "---\n\n"
+        f"# IRED Autoencoder — `{repo_id}`\n\n"
+        f"Frozen BART autoencoder with compression/reconstruction split.\n\n"
+        f"- **Pool type:** `{ae.pool_type}`\n"
+        f"- **Latent slots (K):** {ae.k}\n"
+        f"- **d_ae:** {ae.d_ae}\n"
+        f"- **PointerGenerator:** {'yes' if ae.use_copy else 'no'}\n"
+        f"- **Decoder fine-tuned:** {'yes' if ae.train_decoder else 'no'}\n"
+        f"- **Base model:** `{ae.model_name}`\n"
+        f"- **Training steps:** {step}\n\n"
+        "## Usage\n\n"
+        "```python\n"
+        "from ired.model.autoencoder import FrozenBartAutoencoder\n"
+        "import torch\n\n"
+        "ae = FrozenBartAutoencoder(\n"
+        f"    model_name='{ae.model_name}',\n"
+        f"    k={ae.k},\n"
+        f"    pool_type='{ae.pool_type}',\n"
+        f"    d_ae={ae.d_ae},\n"
+        f"    use_copy={ae.use_copy},\n"
+        f"    train_decoder={ae.train_decoder},\n"
+        ")\n"
+        "ckpt = torch.load('ae_checkpoint.pt', map_location='cpu')\n"
+        "ae.load_ae(ckpt['ae'])\n"
+        "```\n"
+    )
+    card_path = os.path.join(save_dir, "model_card.md")
+    with open(card_path, "w") as f:
+        f.write(card)
+
+    # Upload.
+    for path, path_in_repo in [
+        (ckpt_path, "ae_checkpoint.pt"),
+        (config_path, "config.json"),
+        (card_path, "README.md"),
+    ]:
+        log_fn(f"  uploading {path_in_repo} …")
+        api.upload_file(
+            path_or_fileobj=path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            token=token,
+        )
+
+    log_fn(f"  done — https://huggingface.co/{repo_id}")
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # Two-pass parse: first extract --config, load its YAML as defaults,
+    # then re-parse so CLI flags override.
+    pre_args, _ = parser.parse_known_args(argv)
+    if pre_args.config is not None:
+        if yaml is None:
+            parser.error("--config requires PyYAML (`pip install pyyaml`)")
+        with open(pre_args.config) as f:
+            cfg = yaml.safe_load(f)
+        if not isinstance(cfg, dict):
+            parser.error(f"config file {pre_args.config!r} must be a YAML mapping")
+        parser.set_defaults(**cfg)
+    args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -262,6 +428,8 @@ def main(argv=None):
             d_ae=d_ae,
             recon_layers=args.recon_layers,
             recon_heads=args.recon_heads,
+            use_copy=args.use_copy,
+            train_decoder=args.unfreeze_decoder,
         ).to(args.device)
         ae.train()
         r.log(f"d_model={ae.d_model}  d_ae={ae.d_ae}")
@@ -344,7 +512,10 @@ def main(argv=None):
         pool_params = ae.trainable_parameters()
         n_params = sum(p.numel() for p in pool_params)
         r.log(f"trainable AE params (pool + recon): {n_params:,}")
-        param_groups = build_param_groups(ae, args.weight_decay)
+        param_groups = build_param_groups(
+            ae, args.weight_decay,
+            decoder_lr=args.decoder_lr if args.unfreeze_decoder else None,
+        )
         n_decay = sum(p.numel() for p in param_groups[0]["params"])
         n_nodecay = sum(p.numel() for p in param_groups[1]["params"])
         opt = AdamW(param_groups, lr=args.lr)
@@ -480,6 +651,24 @@ def main(argv=None):
                 }
                 torch.save(ckpt, os.path.join(args.save_dir, f"ae_step{step}.pt"))
                 torch.save(ckpt, os.path.join(args.save_dir, "ae_latest.pt"))
+
+        # ── push final checkpoint to HuggingFace Hub ───────────────────
+        if args.push_to_hub:
+            if not _has_hf_hub:
+                r.log("ERROR: --push-to-hub requires huggingface_hub (`pip install huggingface_hub`)")
+            elif args.hub_repo is None:
+                r.log("ERROR: --push-to-hub requires --hub-repo (e.g. 'username/ae-conv-pg')")
+            else:
+                r.log(f"pushing final checkpoint to HF Hub: {args.hub_repo}")
+                _push_checkpoint_to_hub(
+                    ae=ae,
+                    repo_id=args.hub_repo,
+                    save_dir=args.save_dir,
+                    step=step,
+                    token=args.hub_token,
+                    private=args.hub_private,
+                    log_fn=r.log,
+                )
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import argparse
 
 import torch
 
-from ired.autoencoder import FrozenBartAutoencoder
+from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import MBPPDataset
 
 

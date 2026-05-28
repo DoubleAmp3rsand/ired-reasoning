@@ -1,0 +1,68 @@
+# Autoencoder training config — conv pool + PointerGenerator + unfrozen decoder
+#
+# Launch:  uv run python -m ired.train_autoencoder --config configs/ae_conv_pg.yaml
+# CLI args override config values, so e.g. `--seed 42` on the command line
+# wins over the `seed: 0` below.
+
+# ── Model ──────────────────────────────────────────────────────────────
+model: facebook/bart-base   # base | large (diffusion space grows with d_ae, so large is costly)
+
+# ── AttentionPool (f_φ) ────────────────────────────────────────────────
+k: 256                       # latent slots
+pool_layers: 2
+pool_heads: 8
+pool_type: conv              # depthwise-separable conv + adaptive pool
+# d_ae: 128                  # uncomment to shrink diffusion space
+# diffusion space -> k*d_ae, so d_ae = 128 → 32k dim, vs 768 → 196k for full BART base
+# ── ReconstructionNet (f_ψ) ────────────────────────────────────────────
+recon_layers: 2
+recon_heads: 8
+
+# ── Decode-side knobs ──────────────────────────────────────────────────
+use_copy: true               # PointerGenerator over source tokens
+unfreeze_decoder: false      # fine-tune BART decoder jointly
+decoder_lr: 1.0e-5           # separate (smaller) LR for decoder params
+
+# ── Training data ──────────────────────────────────────────────────────
+train_dataset: openwebtext
+owt_samples: 100000          # OWT docs to materialize
+owt_min_chars: 200
+owt_max_chars: 4000
+owt_eval_samples: 256
+
+code_mix_ratio: 0.3          # fraction CodeSearchNet Python (0 = pure OWT)
+code_samples: 60000          # CodeSearchNet fns to materialize
+code_min_chars: 100
+code_max_chars: 4000
+
+mixed_length: 160000         # virtual length of mixed OWT+code dataset
+
+# ── Optimization ───────────────────────────────────────────────────────
+batch_size: 64
+grad_accum_steps: 1          # effective batch = batch_size × this
+lr: 1.0e-4
+weight_decay: 0.01
+warmup_steps: 500
+min_lr_ratio: 0.1            # cosine floor as fraction of lr
+
+steps: 15000                 # total optimizer steps
+log_every: 50                # steps between log lines
+eval_every: 1000             # steps between eval cycles
+
+# ── Eval ───────────────────────────────────────────────────────────────
+max_a_length: 256            # tokenizer truncation cap
+eval_n_examples: 64          # per-dataset examples each eval
+eval_beams: 4                # beam width for code eval (OWT stays greedy)
+
+# ── Infrastructure ─────────────────────────────────────────────────────
+num_workers: 4
+seed: 0
+device: cuda                 # cuda | cpu
+tui: true                    # Rich+plotext TUI (graphs + scrolling log)
+save_dir: checkpoints/ae_conv_pg
+
+# ── HuggingFace Hub (optional) ─────────────────────────────────────────
+push_to_hub: true
+hub_repo: roy-W/ired-reasoning
+# hub_token: hf_...          # defaults to HF_TOKEN env var
+hub_private: false

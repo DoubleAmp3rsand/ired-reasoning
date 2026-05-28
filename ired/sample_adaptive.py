@@ -22,14 +22,14 @@ import time
 import torch
 
 from ired.actor import Actor
-from ired.autoencoder import FrozenBartAutoencoder
+from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
     HumanEvalDataset,
     MBPPDataset,
     verify_code,
 )
-from ired.diffusion import GaussianLatentDiffusion
-from ired.energy_net import DiffusionWrapper, EnergyTransformer
+from ired.model.diffusion import GaussianLatentDiffusion
+from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
 
 
 def build_parser():

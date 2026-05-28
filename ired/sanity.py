@@ -8,9 +8,9 @@ import argparse
 
 import torch
 
-from ired.autoencoder import FrozenBartAutoencoder
-from ired.diffusion import GaussianLatentDiffusion
-from ired.energy_net import DiffusionWrapper, EnergyTransformer
+from ired.model.autoencoder import FrozenBartAutoencoder
+from ired.model.diffusion import GaussianLatentDiffusion
+from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
 
 
 def main(argv=None):

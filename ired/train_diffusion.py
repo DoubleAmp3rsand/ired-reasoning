@@ -4,7 +4,8 @@ Pipeline per step:
   with no_grad:
       z_q = ae.encode_to_latents(question)
       z_a = ae.encode_to_latents(answer)
-  loss, stats = diffusion(z_q, z_a)
+  loss, stats = diffusion(z_q, z_a, gold_texts=...)   # gold passed only if a
+                                                      # decode-grounded term is on
   loss.backward()
   opt.step()
 
@@ -12,6 +13,34 @@ Only the EBM updates. The autoencoder (frozen BART + previously trained pool) is
 held fixed. Every `eval_every` steps we sample end-to-end and report per-corpus
 pass-rates on MBPP test and HumanEval separately (correctness via subprocess
 execution of the decoded code against per-example test fixtures).
+
+Loss terms (see GaussianLatentDiffusion.p_losses)
+-------------------------------------------------
+Always on:
+  - MSE        : denoising regression, ε̂ = ∇_{z_t}E ≈ noise.
+  - NCE        : E(z_a) < E(mined hard-negative), where the negative is mined
+                 geometrically (heavy-noise + 2 opt_steps). Calibrates the
+                 absolute energy scale so bad-step rejection is meaningful.
+
+Optional (off by default; enable per the flags below):
+  - rand-neg   (--rand-neg-weight)   : E(real) + margin < E(N(0,I)).
+  - decoder-aux(--decoder-aux-weight): CE(decode(x0_hat), gold) on low-t samples.
+  - gen-neg    (--gen-neg-weight)    : generator-grounded negative. The MSE/NCE
+                 terms shape the energy field with no knowledge of what the
+                 decoder/point-generator actually emits — the energy manifold
+                 does not know the shape of the generator. This term decodes the
+                 NCE-mined latent's clean estimate through the *inference*
+                 (no-copy) generator and, where that decode is wrong, pushes
+                 E(real) + margin < E(refined). The decode/CE is a detached gate;
+                 the gradient comes only from the energy margin (cheap — reuses
+                 the energy the NCE term already computed). Together with the
+                 no-copy fix below it ties the energy minima to the latents the
+                 generator we actually run can decode.
+
+Both decode-grounded terms (decoder-aux, gen-neg) decode through the **no-copy**
+path (`copy=False`), matching `ae.decode(z, src_texts=None)` at EBM inference.
+With copy on, the pointer-generator's source is the gold answer, so CE collapses
+by copying gold verbatim and the EBM gets no usable signal on the latent.
 """
 from __future__ import annotations
 
@@ -19,11 +48,16 @@ import argparse
 import os
 import time
 
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
+
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from ired.autoencoder import FrozenBartAutoencoder
+from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
     HumanEvalDataset,
     MBPPDataset,
@@ -31,8 +65,8 @@ from ired.data import (
     make_collate_pretokenized,
     verify_code_batch,
 )
-from ired.diffusion import GaussianLatentDiffusion
-from ired.energy_net import DiffusionWrapper, EnergyTransformer
+from ired.model.diffusion import GaussianLatentDiffusion
+from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
 from ired.tui import make_reporter
 
 
@@ -60,6 +94,9 @@ def _resolve_ckpt_path(spec: str) -> str:
 
 def build_parser():
     p = argparse.ArgumentParser(description="Train IRED energy network in latent space")
+    p.add_argument("--config", default=None,
+                   help="path to a YAML config file. Values become defaults; "
+                        "CLI flags override them. Requires PyYAML (`pip install pyyaml`).")
     # autoencoder
     p.add_argument("--model", default="facebook/bart-base")
     p.add_argument("--ae-ckpt",
@@ -71,8 +108,12 @@ def build_parser():
     p.add_argument("--k", type=int, default=128, help="Must match the AE checkpoint's k.")
     p.add_argument("--pool-layers", type=int, default=2)
     p.add_argument("--pool-heads", type=int, default=8)
-    p.add_argument("--pool-type", choices=["decoder", "resampler"], default="decoder",
-                   help="Must match the AE checkpoint's pool_type.")
+    p.add_argument("--pool-type", choices=["decoder", "resampler", "conv"], default="decoder",
+                   help="Must match the AE checkpoint's pool_type. Auto-overridden "
+                        "from the checkpoint's config when present.")
+    p.add_argument("--use-copy", action="store_true",
+                   help="AE has a pointer-generator (point generator) head. Must "
+                        "match the AE checkpoint; auto-overridden from its config.")
     p.add_argument("--d-ae", type=int, default=-1,
                    help="diffusion-space latent dim. Must match the AE checkpoint.")
     p.add_argument("--recon-layers", type=int, default=2)
@@ -114,6 +155,25 @@ def build_parser():
                         "t < this. At high t, q(z_t|z_a) and N(0,I) overlap, "
                         "so the anchor there fights eps prediction. With T=10, "
                         "try 3 (low-noise only).")
+    p.add_argument("--gen-neg-weight", type=float, default=0.0,
+                   help="weight on the generator-grounded negative. Decodes the "
+                        "NCE-mined latent through the no-copy (inference) "
+                        "generator and, where that decode is wrong, pushes "
+                        "E(real) + margin < E(refined). Makes the energy field "
+                        "aware of what the point-generator actually emits. "
+                        "0 disables; recommended start: 1.0.")
+    p.add_argument("--gen-neg-margin", type=float, default=1.0,
+                   help="margin in softplus(e_real - e_refined + margin) for the "
+                        "generator-grounded negative.")
+    p.add_argument("--gen-neg-t-max", type=int, default=3,
+                   help="only apply the generator-grounded negative for samples "
+                        "with t < this. The clean x_0 estimate decoded by the "
+                        "gate is only reliable at low noise. With T=10, try 3.")
+    p.add_argument("--gen-neg-ce-thresh", type=float, default=0.5,
+                   help="no-copy teacher-forced CE (nats/token) above which the "
+                        "mined latent is treated as a generator-validated "
+                        "negative. Lower = stricter (more latents count as "
+                        "negatives).")
     # data & opt
     p.add_argument("--train-dataset", choices=["mbpp"], default="mbpp",
                    help="Corpus the EBM trains on. Only MBPP is wired in by default; "
@@ -284,7 +344,19 @@ def eval_corpus(ae, diffusion, dataset, dataset_name, device,
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # Two-pass parse: first extract --config, load its YAML as defaults, then
+    # re-parse so CLI flags override (matches train_autoencoder).
+    pre_args, _ = parser.parse_known_args(argv)
+    if pre_args.config is not None:
+        if yaml is None:
+            parser.error("--config requires PyYAML (`pip install pyyaml`)")
+        with open(pre_args.config) as f:
+            cfg = yaml.safe_load(f)
+        if not isinstance(cfg, dict):
+            parser.error(f"config file {pre_args.config!r} must be a YAML mapping")
+        parser.set_defaults(**cfg)
+    args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -298,6 +370,23 @@ def main(argv=None):
     ) as r:
         # autoencoder
         r.log(f"loading autoencoder: {args.model}")
+        ae_ckpt_path = _resolve_ckpt_path(args.ae_ckpt)
+        if ae_ckpt_path != args.ae_ckpt:
+            r.log(f"  pulled AE checkpoint from HF Hub → {ae_ckpt_path}")
+        ckpt = torch.load(ae_ckpt_path, map_location=args.device)
+
+        # Architecture must match the checkpoint exactly or load_ae raises. The
+        # checkpoint's training config is the source of truth, so override the
+        # arch-defining args from it (k, pool_type, d_ae, use_copy) and log any
+        # change. CLI values for these are only a fallback for older checkpoints.
+        ck_cfg = ckpt.get("config", {})
+        for field, attr in (("k", "k"), ("pool_type", "pool_type"),
+                            ("d_ae", "d_ae"), ("use_copy", "use_copy")):
+            if field in ck_cfg and getattr(args, attr) != ck_cfg[field]:
+                r.log(f"  [arch] overriding --{attr.replace('_', '-')} "
+                      f"{getattr(args, attr)} → {ck_cfg[field]} (from checkpoint config)")
+                setattr(args, attr, ck_cfg[field])
+
         d_ae = args.d_ae if args.d_ae > 0 else None
         ae = FrozenBartAutoencoder(
             model_name=args.model,
@@ -308,11 +397,8 @@ def main(argv=None):
             d_ae=d_ae,
             recon_layers=args.recon_layers,
             recon_heads=args.recon_heads,
+            use_copy=args.use_copy,
         ).to(args.device)
-        ae_ckpt_path = _resolve_ckpt_path(args.ae_ckpt)
-        if ae_ckpt_path != args.ae_ckpt:
-            r.log(f"  pulled AE checkpoint from HF Hub → {ae_ckpt_path}")
-        ckpt = torch.load(ae_ckpt_path, map_location=args.device)
         if "ae" in ckpt:
             ae.load_ae(ckpt["ae"])
         else:
@@ -357,19 +443,45 @@ def main(argv=None):
             rand_neg_weight=args.rand_neg_weight,
             rand_neg_margin=args.rand_neg_margin,
             rand_neg_t_max=args.rand_neg_t_max,
+            gen_neg_weight=args.gen_neg_weight,
+            gen_neg_margin=args.gen_neg_margin,
+            gen_neg_t_max=args.gen_neg_t_max,
+            gen_neg_ce_thresh=args.gen_neg_ce_thresh,
         ).to(args.device)
         diffusion.train()
 
         if args.decoder_aux_weight > 0:
+            # No-copy CE: matches ae.decode(z, src_texts=None) at EBM inference.
+            # With copy on, the source is the gold answer, so the loss collapses
+            # by copying gold and gives the EBM almost no gradient on the latent.
             def _decoder_loss_fn(x0_hat, texts):
-                return ae.decode_loss(x0_hat, texts, args.device, max_length=args.max_a_length)
+                return ae.decode_loss(
+                    x0_hat, texts, args.device,
+                    max_length=args.max_a_length, copy=False,
+                )
             diffusion.set_decoder_loss_fn(_decoder_loss_fn)
-            r.log(f"decoder-aux enabled: weight={args.decoder_aux_weight} t_max={args.decoder_aux_t_max}")
+            r.log(f"decoder-aux enabled (no-copy): weight={args.decoder_aux_weight} t_max={args.decoder_aux_t_max}")
 
         if args.rand_neg_weight > 0:
             r.log(
                 f"rand-neg anchor enabled: weight={args.rand_neg_weight} "
                 f"margin={args.rand_neg_margin} t_max={args.rand_neg_t_max}"
+            )
+
+        if args.gen_neg_weight > 0:
+            # No-copy per-example CE: matches ae.decode(z, src_texts=None) used
+            # at EBM inference, so the energy is grounded against the generator
+            # we actually run (not the copy-from-gold path, which collapses CE).
+            def _gen_ce_fn(z_native, texts):
+                return ae.decode_loss_per_example(
+                    z_native, texts, args.device,
+                    max_length=args.max_a_length, copy=False,
+                )
+            diffusion.set_gen_ce_fn(_gen_ce_fn)
+            r.log(
+                f"generator-grounded negative enabled: weight={args.gen_neg_weight} "
+                f"margin={args.gen_neg_margin} t_max={args.gen_neg_t_max} "
+                f"ce_thresh={args.gen_neg_ce_thresh}"
             )
 
         n_params = sum(p.numel() for p in ebm.parameters())
@@ -497,9 +609,10 @@ def main(argv=None):
                     z_q = ae.encode_to_latents_from_ids(q_ids, q_mask)
                     z_a = ae.encode_to_latents_from_ids(a_ids, a_mask)
 
+                need_gold = args.decoder_aux_weight > 0 or args.gen_neg_weight > 0
                 loss, stats = diffusion(
                     z_q, z_a,
-                    gold_texts=batch["answer"] if args.decoder_aux_weight > 0 else None,
+                    gold_texts=batch["answer"] if need_gold else None,
                 )
                 if not torch.isfinite(loss):
                     raise RuntimeError(

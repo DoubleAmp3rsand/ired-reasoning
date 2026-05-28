@@ -29,6 +29,12 @@ from tqdm import tqdm
 # EBM via x0_hat.
 DecoderLossFn = Callable[[torch.Tensor, list[str]], torch.Tensor]
 
+# A generator-CE callback receives a sub-batch of AE-native clean latents
+# (B', K, d) and the matching gold texts, and returns a per-example, no-copy
+# teacher-forced CE of shape (B',). Used only as a *gate* (no gradient flows
+# through it) to decide which mined latents are generator-validated negatives.
+GenCEFn = Callable[[torch.Tensor, list[str]], torch.Tensor]
+
 
 def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Sequence[int]) -> torch.Tensor:
     """Pull per-batch values out of a 1-D schedule and broadcast to `x_shape`."""
@@ -92,6 +98,24 @@ class GaussianLatentDiffusion(nn.Module):
         rand_neg_weight: float = 0.0,
         rand_neg_margin: float = 1.0,
         rand_neg_t_max: int = 1_000_000,
+        # Generator-grounded negative. The NCE term mines a hard negative
+        # purely geometrically (heavy-noise + 2 opt_step), so the energy field
+        # is shaped without any knowledge of what the decoder/point-generator
+        # actually emits — "the energy manifold does not know the shape of the
+        # generator." This term closes that gap: it decodes the mined latent's
+        # clean estimate through the *inference* (no-copy) generator path, and
+        # only when that decode is wrong (gold-CE > gen_neg_ce_thresh) does it
+        # treat the latent as a validated negative and push
+        # E(real) + margin < E(refined) via softplus. The decode/CE is a
+        # detached gate only — the learning signal is the energy margin, so no
+        # gradient flows through the decoder or the inner loop (cheap; reuses
+        # the sample the NCE term already mined). Gated to t < gen_neg_t_max
+        # because the clean estimate predict_start_from_noise(...) is only
+        # reliable at low noise, where a decode is meaningful.
+        gen_neg_weight: float = 0.0,
+        gen_neg_margin: float = 1.0,
+        gen_neg_t_max: int = 1_000_000,
+        gen_neg_ce_thresh: float = 0.5,
     ):
         super().__init__()
         self.model = model
@@ -108,7 +132,12 @@ class GaussianLatentDiffusion(nn.Module):
         self.rand_neg_weight = float(rand_neg_weight)
         self.rand_neg_margin = float(rand_neg_margin)
         self.rand_neg_t_max = int(rand_neg_t_max)
+        self.gen_neg_weight = float(gen_neg_weight)
+        self.gen_neg_margin = float(gen_neg_margin)
+        self.gen_neg_t_max = int(gen_neg_t_max)
+        self.gen_neg_ce_thresh = float(gen_neg_ce_thresh)
         self._decoder_loss_fn: DecoderLossFn | None = None
+        self._gen_ce_fn: GenCEFn | None = None
 
         if beta_schedule == "linear":
             betas = linear_beta_schedule(timesteps)
@@ -189,6 +218,13 @@ class GaussianLatentDiffusion(nn.Module):
         """Register a callback for the decoder-CE auxiliary. Must be set if
         decoder_aux_weight > 0 and the user calls forward with gold_texts."""
         self._decoder_loss_fn = fn
+
+    def set_gen_ce_fn(self, fn: GenCEFn | None) -> None:
+        """Register the no-copy per-example CE callback used to gate the
+        generator-grounded negative. Must be set if gen_neg_weight > 0 and the
+        caller passes gold_texts. The callback runs under no_grad — it only
+        decides which mined latents count as negatives."""
+        self._gen_ce_fn = fn
 
     # ------------------------------------------------------------------
     # forward / posterior helpers
@@ -419,6 +455,44 @@ class GaussianLatentDiffusion(nn.Module):
                 stats["rand"] = 0.0
                 stats["e_rand"] = 0.0
                 stats["rand_n"] = 0
+
+        # Generator-grounded negative: decode the mined latent's clean estimate
+        # through the no-copy (inference) generator and, where that decode is
+        # wrong, push E(real) + margin < E(refined). e_fake already scores the
+        # renoised mined latent, so we reuse it — the CE is a detached gate, the
+        # gradient comes only from the energy margin.
+        if self.gen_neg_weight > 0 and gold_texts is not None:
+            if self._gen_ce_fn is None:
+                raise RuntimeError(
+                    "gen_neg_weight > 0 but no gen-CE fn registered; "
+                    "call set_gen_ce_fn(...)."
+                )
+            gmask = t < self.gen_neg_t_max
+            if bool(gmask.any()):
+                idx_g = gmask.nonzero(as_tuple=True)[0]
+                # x_min_unscaled is the clean (x_0) estimate of the refined
+                # latent in normalized space; the decoder wants AE-native.
+                z_ref_native = self._denormalize(
+                    x_min_unscaled.index_select(0, idx_g)
+                ).detach()
+                texts_g = [gold_texts[i] for i in idx_g.tolist()]
+                with torch.no_grad():
+                    ce_ref = self._gen_ce_fn(z_ref_native, texts_g)  # (Bg,)
+                wrong = (ce_ref > self.gen_neg_ce_thresh).float()[:, None]  # (Bg, 1)
+                e_real_g = e_real.index_select(0, idx_g)
+                e_fake_g = e_fake.index_select(0, idx_g)
+                margin = F.softplus(e_real_g - e_fake_g + self.gen_neg_margin)
+                loss_gen = (wrong * margin).sum() / wrong.sum().clamp(min=1.0)
+                loss_total = loss_total + self.gen_neg_weight * loss_gen
+                stats["gen"] = loss_gen.item()
+                stats["gen_ce"] = ce_ref.mean().item()
+                stats["gen_wrong"] = int(wrong.sum().item())
+                stats["gen_n"] = int(gmask.sum().item())
+            else:
+                stats["gen"] = 0.0
+                stats["gen_ce"] = 0.0
+                stats["gen_wrong"] = 0
+                stats["gen_n"] = 0
 
         loss_total, stats = self._maybe_add_decoder_aux(
             loss_total, stats, z_t, eps_hat, t, gold_texts
