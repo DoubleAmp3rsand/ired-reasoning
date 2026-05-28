@@ -252,7 +252,7 @@ example's tests.
 | `ae_acc` | pass-rate of `decode(encode(answer))` — the Milestone-1 AE ceiling |
 | `mse_z`, `corr_z` | L2 / cosine of sampled latent vs `z_a` |
 | `std_za`, `std_zs` | element-std of gold vs sampled latents (scale drift) |
-| `ce_pass` / `ce_fail` / `eb_gap` | teacher-forced CE on the sampled latent, split by free-running pass/fail. A large `eb_gap` (`ce_fail − ce_pass`) means latent quality tracks correctness; a small gap with both CEs low means the latent points the decoder at gold but free-running decode still flakes (AR leakage — see `docs/exposure_bias.md`). |
+| `ce_pass` / `ce_fail` / `eb_gap` | teacher-forced CE on the sampled latent, split by free-running pass/fail. A large `eb_gap` (`ce_fail − ce_pass`) means latent quality tracks correctness; a small gap with both CEs low means the latent points the decoder at gold but free-running decode still flakes (AR leakage). |
 
 `ae_acc < 0.5` on either corpus means the **AE is the bottleneck**, not the EBM.
 
@@ -426,7 +426,6 @@ of `K`. Shrinking `d_ae` shrinks both the EBM and its diffusion space.
 | `ired/train_diffusion.py` | Training script (Milestone 2) + `eval_corpus` |
 | `configs/ebm.yaml` | Reference training config |
 | `ired/diagnose_ebm.py` | EBM diagnostics |
-| `docs/exposure_bias.md` | AR-decoder leakage diagnostic (the `eb_gap` metric) |
 | `docs/autoencoder.md` | The latent space the EBM operates in |
 | `gensis.md` §10 | Diffusion / inner-loop design rationale |
 

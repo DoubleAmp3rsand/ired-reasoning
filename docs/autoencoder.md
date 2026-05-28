@@ -394,7 +394,7 @@ to 6 decimal places.
 
 ### 6.3 Pool type comparison
 
-See `docs/ablation_study_autoencoder.md` for the empirical comparison on GSM8K.
+Empirical comparison on GSM8K:
 
 | Pool type | Mechanism | GSM8K loss @ 5k steps | Best for |
 |-----------|-----------|----------------------|----------|
@@ -481,8 +481,6 @@ BART encoder is always frozen (~62M parameters, zero gradients).
 | `ired/model/autoencoder.py` | Module definition — all classes |
 | `ired/train_autoencoder.py` | Training script (Milestone 1) |
 | `checkpoints/ae_*/` | Saved AE checkpoints |
-| `docs/ablation_study_autoencoder.md` | Pool type comparison on GSM8K |
-| `docs/exposure_bias.md` | AR decoder leakage diagnostic (uses `decode_loss_per_example`) |
 | `gensis.md` §7.3, §9 | Architecture rationale, Milestone 1 gate |
 
 ---
