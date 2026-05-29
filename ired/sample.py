@@ -1,4 +1,4 @@
-"""Milestone 3 (gensis.md §9): test-time compute curve.
+"""Milestone 3 (gensis.md §7): test-time compute curve.
 
 Sweeps `inner_steps` ∈ {0, 1, 2, 5, 10} and reports pass-rate on the chosen
 eval corpus (MBPP or HumanEval). The "decision rule" in gensis: a steeper

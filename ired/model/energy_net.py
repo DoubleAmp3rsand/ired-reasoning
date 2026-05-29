@@ -5,7 +5,7 @@ Inputs:
   z_t : (B, K, d) — noisy answer latents (the variable to denoise)
   t   : (B,)      — diffusion timestep
 
-Architecture (matching gensis.md §3-§5 and §10.1):
+Architecture (matching gensis.md §3):
   Tokens fed to self-attention:
     [time_token] + [z_q with type=0 + per-position emb] + [z_t with type=1 + per-position emb]
   Four transformer encoder layers, then a Linear head over the z_t slots.

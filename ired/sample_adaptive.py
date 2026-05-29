@@ -1,4 +1,4 @@
-"""Adaptive Mode-1 / Mode-2 inference (gensis.md §5.4).
+"""Adaptive Mode-1 / Mode-2 inference (gensis.md §4.3).
 
 Default to the fast actor; escalate to the slow IRED rollout when the EBM
 energy on the actor's output exceeds `threshold`. The gate scalar is exactly

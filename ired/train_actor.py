@@ -1,4 +1,4 @@
-"""Distillation training for the Mode-1 actor (gensis.md §5.3).
+"""Distillation training for the Mode-1 actor (gensis.md §4.2).
 
 Pipeline per step:
 

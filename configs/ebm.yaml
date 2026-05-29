@@ -36,6 +36,13 @@ opt_step_size: 1.0
 x_start_clamp: 5.0            # clamp predicted x_0 to ±this (<=0 disables)
 envelope_sf: -1.0            # >0 → clamp z to ±sqrt(alpha_bar_t)*sf (IRED uses 2.0)
 
+# Stochastic inner loop (inference only). 0 = deterministic descent + bad-step
+# rejection (IRED default). >0 injects annealed Langevin noise (z ← z − α·∇E +
+# σ·ξ, σ decays to 0 on the last inner step) so the chain can escape shallow
+# minima instead of freezing at the first energy bump. ~1.0 targets p ∝ exp(−E).
+opt_noise_scale: 0.0         # try ~0.1 to start
+opt_reject: true             # false + noise>0 → true Langevin (accepts uphill moves)
+
 # ── Loss terms ─────────────────────────────────────────────────────────────
 # Always on: denoising MSE + NCE (E(real) < E(geometric hard-negative)).
 no_nce: false                # set true to disable NCE energy-landscape supervision

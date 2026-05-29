@@ -7,7 +7,7 @@ The answer latent is then decoded back to text by the (frozen) autoencoder.
 
 Everything here operates **inside the latent space the AE defines** — see
 `docs/autoencoder.md`. The AE is trained first and frozen; only the EBM updates
-during Milestone 2 (`gensis.md` §9, §10).
+during Milestone 2 (`gensis.md` §7).
 
 ---
 
@@ -53,7 +53,7 @@ Two consequences:
    alone fixes `∇E` but leaves the absolute scale of `E` free, so the NCE term
    (and the optional anchors in §4) exist to pin it down.
 
-`gensis.md` §10 is the source for the diffusion / inner-loop design; the code
+`gensis.md` §3.4 is the source for the diffusion / inner-loop design; the code
 adapts IRED's continuous (matrix-addition) `GaussianDiffusion1D` into latent
 space.
 
@@ -151,6 +151,8 @@ Owns the DDPM schedules and all of training + sampling. Key construction knobs
 | `timesteps` (10) | number of outer DDPM steps `T` |
 | `beta_schedule` ("linear") | `linear` or `cosine`; validated so `alpha_cumprod > 0` |
 | `opt_step_size` (1.0) | inner-loop gradient-descent step size (per-`t` buffer) |
+| `opt_noise_scale` (0.0) | Langevin/SGLD noise on the inference inner loop; `0` = deterministic (§5.1.1) |
+| `opt_reject` (True) | keep the monotone bad-step filter; `False` + noise = true Langevin (§5.1.1) |
 | `loss_scale` (1.0) | weight `λ` on the NCE term |
 | `objective` ("pred_noise") | `pred_noise` (ε) or `pred_x0` |
 | `x_start_clamp` (5.0) | clamp predicted `x_0` to ±this; `None` disables |
@@ -283,6 +285,48 @@ Per sample, a refinement step is **kept only if it lowers the energy**. Because
 `E` is a calibrated scalar (§2), this is a meaningful accept/reject — it is what
 distinguishes IRED's iterative reasoning from plain diffusion sampling.
 
+The deterministic gradient step has a known limitation: when `E_new > E` it is
+almost always because the step *overshot* the local minimum, but the rejection
+keeps `z` unchanged, so the remaining inner iterations recompute the identical
+gradient at the identical point and stall (the inner budget is wasted). It also
+cannot cross a small energy ridge to reach a deeper basin — it freezes at the
+first bump.
+
+### 5.1.1 Stochastic inner loop (Langevin / SGLD) — optional
+
+Set `opt_noise_scale > 0` (config `opt_noise_scale`, default `0.0`) to make the
+inference inner loop an **annealed Langevin** update:
+
+```python
+z_new = z − step_size · grad + σ · ξ          # ξ ~ N(0, I)
+σ     = opt_noise_scale · sqrt(2·step_size) · decay
+```
+
+`decay` falls linearly to `0` on the last inner step, so the chain explores
+early and settles into a minimum at the end. `opt_noise_scale ≈ 1` targets the
+Boltzmann density `p ∝ exp(−E)`; smaller is greedier. `opt_reject` (default
+`true`) toggles the monotone filter:
+
+| `opt_reject` | with noise | behaviour |
+|---|---|---|
+| `true`  | yes | **stochastic greedy** — fresh noise each iter breaks the stall, but only downhill moves stick (cannot cross ridges) |
+| `false` | yes | **true Langevin** — uphill moves are accepted, so the chain can climb over small bumps into a deeper basin |
+| `true`  | no (`0.0`) | the deterministic IRED default above |
+
+This is **inference-only**; training hard-negative mining stays deterministic
+(`opt_step` is called with `noise_scale=0`). When `opt_reject=false` the inner
+loop also skips the second energy forward (the energy value is unused), so each
+iter is one forward instead of two.
+
+> Note: `E` is calibrated where it was trained — near the data manifold and the
+> deterministic trajectory negatives are mined along. Aggressive Langevin can push
+> `z` into regions `E` never saw, where lower energy is extrapolation rather than a
+> better answer (the off-manifold minima §4.3 attacks). In that regime — and only
+> there — it's worth cross-checking the visited candidates against the no-copy
+> decoder CE or the verifier. This guards the extrapolation, not a distrust of `E`
+> on the deterministic path, where it remains the quality scalar bad-step rejection
+> relies on.
+
 ### 5.2 `p_sample` — one DDPM step
 
 Standard DDPM posterior: predict `ε̂`, recover `x_0` (clamped to
@@ -306,6 +350,8 @@ diffusion = GaussianLatentDiffusion(
     timesteps=10,
     beta_schedule="linear",
     opt_step_size=1.0,
+    opt_noise_scale=0.0,            # >0 → Langevin inner loop (inference only)
+    opt_reject=True,                # False + noise → accept uphill moves
     loss_scale=1.0,                 # NCE weight
     supervise_energy_landscape=True,  # turn NCE off via --no-nce
     x_start_clamp=5.0,
@@ -427,7 +473,7 @@ of `K`. Shrinking `d_ae` shrinks both the EBM and its diffusion space.
 | `configs/ebm.yaml` | Reference training config |
 | `ired/diagnose_ebm.py` | EBM diagnostics |
 | `docs/autoencoder.md` | The latent space the EBM operates in |
-| `gensis.md` §10 | Diffusion / inner-loop design rationale |
+| `gensis.md` §3.4 | Diffusion / inner-loop design rationale |
 
 ---
 

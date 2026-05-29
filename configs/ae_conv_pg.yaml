@@ -20,7 +20,7 @@ recon_heads: 8
 
 # ── Decode-side knobs ──────────────────────────────────────────────────
 use_copy: true               # PointerGenerator over source tokens
-unfreeze_decoder: false      # fine-tune BART decoder jointly
+unfreeze_decoder: true       # fine-tune BART decoder jointly (matches the ae_conv_norm_copy2 reference)
 decoder_lr: 1.0e-5           # separate (smaller) LR for decoder params
 
 # ── Training data ──────────────────────────────────────────────────────

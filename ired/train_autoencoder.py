@@ -1,4 +1,4 @@
-"""Milestone 1 (gensis.md §9): train the AttentionPool + ReconstructionNet so
+"""Milestone 1 (gensis.md §7): train the AttentionPool + ReconstructionNet so
 the frozen BART decoder can round-trip text through K latent slots.
 
 The whole BART model stays frozen. Only the pool's + recon's parameters update.
@@ -6,7 +6,7 @@ The whole BART model stays frozen. Only the pool's + recon's parameters update.
 The AE trains on OpenWebText only — a broad natural-language corpus. The
 downstream EBM-training corpora (MBPP, HumanEval) are *never* used to shape
 the AE's latent space, so the EBM cannot exploit an AE-learned distribution
-bias (gensis §3.2 anchoring property).
+bias (gensis §2.2 anchoring property).
 
 Five metrics are reported each eval cycle:
   - owt_recon_cer      character error rate (torchmetrics.text.CharErrorRate)
@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import time
 
 try:
@@ -620,7 +621,12 @@ def main(argv=None):
                 )
 
                 def _snip(s, n=180):
-                    s = s.replace("\n", " ⏎ ")
+                    # Collapse each newline + its surrounding indentation into a
+                    # single ⏎ marker, then squeeze any remaining runs of spaces.
+                    # Code samples (esp. MBPP/HumanEval) are otherwise dominated by
+                    # indentation whitespace — many spaces where one ⏎ reads cleaner.
+                    s = re.sub(r"[ \t]*\n[ \t]*", " ⏎ ", s)
+                    s = re.sub(r"[ \t]{2,}", " ", s)
                     return s if len(s) <= n else s[:n] + "…"
 
                 for name, ev in [("owt", ev_owt), ("mbpp", ev_mbpp), ("humaneval", ev_he)]:

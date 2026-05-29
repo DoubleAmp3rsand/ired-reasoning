@@ -86,7 +86,7 @@ needs the magnitude information in its key/value memory, and stacking a
 third LN (pool's final LN + recon's internal LNs + trailing LN) would
 over-normalize and squash that signal.
 
-Milestone 1 gate (gensis.md §9)
+Milestone 1 gate (gensis.md §7)
 -------------------------------
 
 Verify that ``Decoder(Recon(Pool(Encoder(A)))) ≈ A`` on the target domain

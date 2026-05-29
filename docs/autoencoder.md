@@ -21,7 +21,7 @@ Everything the EBM learns lives inside the latent space the AE defines.
                 z_0  ──►  Recon (f_ψ) ──► BART Dec ──►  A
 ```
 
-The AE is trained first (Milestone 1 in `gensis.md` §9), then frozen while
+The AE is trained first (Milestone 1 in `gensis.md` §7), then frozen while
 the EBM is trained. The AE is deliberately **never trained on the EBM's code
 corpora** — it trains on OpenWebText only, preserving the anchoring property
 (`gensis.md` §3.2): the latent image of the gold answer `z_a = f_φ(Enc(A))`
@@ -245,7 +245,7 @@ CER gives a smooth signal early in training; pass-rate is the downstream-relevan
 metric. A function can have low CER (few chars off) but still fail execution if
 the drift hit an operator or identifier.
 
-### Milestone 1 gate (gensis.md §9)
+### Milestone 1 gate (gensis.md §7)
 
 - MBPP test pass-rate ≥ 80%
 - HumanEval pass-rate ≥ 80%
@@ -481,7 +481,7 @@ BART encoder is always frozen (~62M parameters, zero gradients).
 | `ired/model/autoencoder.py` | Module definition — all classes |
 | `ired/train_autoencoder.py` | Training script (Milestone 1) |
 | `checkpoints/ae_*/` | Saved AE checkpoints |
-| `gensis.md` §7.3, §9 | Architecture rationale, Milestone 1 gate |
+| `gensis.md` §3.2, §7 | Architecture rationale, Milestone 1 gate |
 
 ---
 

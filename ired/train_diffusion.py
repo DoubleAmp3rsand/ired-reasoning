@@ -1,4 +1,4 @@
-"""Milestone 2 (gensis.md §9): train the IRED energy network in latent space.
+"""Milestone 2 (gensis.md §7): train the IRED energy network in latent space.
 
 Pipeline per step:
   with no_grad:
@@ -127,6 +127,13 @@ def build_parser():
     p.add_argument("--inner-steps", type=int, default=5)
     p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="linear")
     p.add_argument("--opt-step-size", type=float, default=1.0)
+    p.add_argument("--opt-noise-scale", type=float, default=0.0,
+                   help="Langevin/SGLD noise on the inference inner loop "
+                        "(0 = deterministic; ~1 targets p ∝ exp(-E); start ~0.1)")
+    p.add_argument("--opt-reject", action=argparse.BooleanOptionalAction, default=True,
+                   help="keep the monotone bad-step rejection in the inner loop. "
+                        "Use --no-opt-reject with --opt-noise-scale>0 for true "
+                        "Langevin (accept uphill moves to cross small bumps).")
     p.add_argument("--continuous", action="store_true", default=True)
     p.add_argument("--no-nce", action="store_true",
                    help="disable energy-landscape supervision (NCE)")
@@ -433,6 +440,8 @@ def main(argv=None):
             timesteps=args.timesteps,
             beta_schedule=args.beta_schedule,
             opt_step_size=args.opt_step_size,
+            opt_noise_scale=args.opt_noise_scale,
+            opt_reject=args.opt_reject,
             loss_scale=args.nce_scale,
             continuous=args.continuous,
             supervise_energy_landscape=not args.no_nce,

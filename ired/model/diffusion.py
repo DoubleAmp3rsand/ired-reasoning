@@ -4,9 +4,13 @@ This is the "thinking module" of the gensis.md proposal — adapted directly fro
 IRED's `GaussianDiffusion1D` (the matrix-addition / continuous variant) to live in
 the latent space defined by the frozen BART encoder + AttentionPool.
 
-Key mechanisms (from gensis.md §10):
+Key mechanisms (from gensis.md §3.4):
   - opt_step: inner-loop gradient descent on the energy with bad-step rejection
               (a step is rejected if the new energy is higher than the old one).
+              Optionally stochastic: with opt_noise_scale > 0 the step becomes an
+              annealed Langevin / SGLD update (z ← z − α·∇E + σ·ξ) so the chain
+              can escape shallow minima the deterministic step would freeze in;
+              opt_reject toggles whether the monotone filter still applies.
   - p_losses: denoising MSE + NCE energy contrast. The NCE term takes a heavily
               noised version of the clean target, refines it via 2 opt_step
               iterations to mine a "hard negative", then pushes the clean
@@ -78,6 +82,21 @@ class GaussianLatentDiffusion(nn.Module):
         # envelope clamp by default. Pass concrete floats to re-enable.
         x_start_clamp: float | None = 5.0,
         envelope_sf: float | None = None,
+        # Stochastic inner loop (Langevin / SGLD) for the *inference* sampler.
+        # By default opt_step is deterministic gradient descent with bad-step
+        # rejection. When opt_noise_scale > 0 the inner step injects annealed
+        # Gaussian noise:  z ← z − α·∇E + σ·ξ,  σ = opt_noise_scale·sqrt(2α)·decay,
+        # where decay falls linearly to 0 on the last inner step so the chain
+        # explores early and settles into a minimum at the end. opt_noise_scale
+        # ≈ 1 targets the Boltzmann density p ∝ exp(−E); smaller is greedier.
+        # opt_reject toggles the monotone "reject energy-increasing step" filter:
+        #   - reject=True  + noise: stochastic greedy — fresh noise each iter
+        #     breaks the deterministic stall, but only downhill moves stick.
+        #   - reject=False + noise: true Langevin — uphill moves are accepted,
+        #     so the chain can climb over small bumps into a deeper basin.
+        # Training hard-negative mining always stays deterministic (noise 0).
+        opt_noise_scale: float = 0.0,
+        opt_reject: bool = True,
         # Optional decoder-CE auxiliary. When > 0 and a callback is registered
         # via set_decoder_loss_fn, p_losses also decodes x0_hat for samples
         # with t < decoder_aux_t_max and adds CE(decode(x0_hat), gold) at the
@@ -127,6 +146,8 @@ class GaussianLatentDiffusion(nn.Module):
         self.loss_scale = loss_scale
         self.x_start_clamp = x_start_clamp
         self.envelope_sf = envelope_sf
+        self.opt_noise_scale = float(opt_noise_scale)
+        self.opt_reject = bool(opt_reject)
         self.decoder_aux_weight = float(decoder_aux_weight)
         self.decoder_aux_t_max = int(decoder_aux_t_max)
         self.rand_neg_weight = float(rand_neg_weight)
@@ -267,24 +288,47 @@ class GaussianLatentDiffusion(nn.Module):
         step: int = 5,
         sf: float = 1.0,
         detach: bool = True,
+        noise_scale: float = 0.0,
+        reject: bool = True,
     ) -> torch.Tensor:
+        """Inner-loop refinement of z by descending the energy.
+
+        Deterministic default (noise_scale=0, reject=True): a gradient step
+        z ← z − α·∇E that is kept only if it lowers the energy. With
+        noise_scale > 0 the step gains annealed Langevin noise
+        z ← z − α·∇E + σ·ξ (σ = noise_scale·sqrt(2α), decayed to 0 on the last
+        inner step) so the chain can explore; `reject` then chooses between
+        stochastic-greedy (keep only downhill noisy proposals) and true Langevin
+        (accept every proposal, allowing uphill moves over small bumps).
+        """
         with torch.enable_grad():
-            for _ in range(step):
-                energy, grad = self.model(z_q, z, t, return_both=True)
+            for i in range(step):
+                if reject:
+                    energy, grad = self.model(z_q, z, t, return_both=True)
+                else:
+                    # no rejection → energy value is unused; one forward suffices
+                    grad = self.model(z_q, z, t, return_energy=False)
                 step_size = extract(self.opt_step_size_t, t, grad.shape)
                 z_new = z - step_size * grad * sf
 
+                if noise_scale > 0.0:
+                    # anneal noise → 0 over the inner steps so the last step is a
+                    # pure descent that settles the chain into the minimum
+                    decay = (step - 1 - i) / max(step - 1, 1)
+                    sigma = (2.0 * step_size).sqrt() * noise_scale * decay
+                    z_new = z_new + sigma * torch.randn_like(z_new)
+
                 z_new = self._clamp_envelope(z_new, t)
 
-                energy_new = self.model(z_q, z_new, t, return_energy=True)
-                # energy is (B, 1); compare per-sample
-                bad = (energy_new[:, 0] > energy[:, 0])
+                if reject:
+                    energy_new = self.model(z_q, z_new, t, return_energy=True)
+                    # energy is (B, 1); compare per-sample
+                    bad = (energy_new[:, 0] > energy[:, 0])
+                    # broadcast bad mask over the latent dims of z
+                    bad_b = bad.view(-1, *((1,) * (z.dim() - 1)))
+                    z_new = torch.where(bad_b, z, z_new)
 
-                # broadcast bad mask over the latent dims of z
-                bad_b = bad.view(-1, *((1,) * (z.dim() - 1)))
-                z_next = torch.where(bad_b, z, z_new)
-
-                z = z_next.detach() if detach else z_next
+                z = z_new.detach() if detach else z_new
         return z
 
     # ------------------------------------------------------------------
@@ -332,7 +376,10 @@ class GaussianLatentDiffusion(nn.Module):
 
             if inner_steps > 0:
                 batched_t = torch.full((b,), t, device=device, dtype=torch.long)
-                z = self.opt_step(z_q, z, batched_t, step=inner_steps, sf=1.0, detach=True)
+                z = self.opt_step(
+                    z_q, z, batched_t, step=inner_steps, sf=1.0, detach=True,
+                    noise_scale=self.opt_noise_scale, reject=self.opt_reject,
+                )
 
             batched_t = torch.full((b,), t, device=device, dtype=torch.long)
             z = self._clamp_envelope(z, batched_t)
