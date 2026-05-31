@@ -60,10 +60,6 @@ text ──► BART Encoder ──► AttentionPool (f_φ) ──► z ∈ R^(K�
 text ◄── BART Decoder ◄── ReconstructionNet (f_ψ) ◄─────┘
          (frozen or         (trainable, identity-init)
           fine-tuned)
-              ▲
-              │
-     PointerGenerator (opt.)
-     point-generator
 ```
 
 | Component | Trainable | Role |
@@ -72,7 +68,16 @@ text ◄── BART Decoder ◄── ReconstructionNet (f_ψ) ◄────�
 | **AttentionPool** (`f_φ`) | ✅ | Compress `(B, L, d_model)` → `(B, K, d_ae)` |
 | **ReconstructionNet** (`f_ψ`) | ✅ | Shape `(B, K, d_ae)` → `(B, K, d_model)` for decoder cross-attn |
 | BART Decoder | ❌ frozen (default) or ✅ `train_decoder=True` | Transduce latent slots → token sequence |
-| **PointerGenerator** | ✅ if `use_copy=True` | Mix vocab distribution with copy-from-source distribution |
+
+> **Note (copy mechanism removed).** Earlier revisions had an optional
+> `PointerGenerator` (`use_copy=True`) that let the decoder copy tokens from a
+> source sequence. It was removed: at EBM generation time the only input is the
+> latent — there is *no* source to copy from — so the copy path was inert at
+> inference, while during AE training (and its eval, which passed the gold
+> answer as the copy source) it let the decoder copy the target verbatim. That
+> inflated reconstruction metrics (~95% MBPP) without forcing the latent to
+> carry the code, leaving the true latent-only decode — the only path the EBM
+> can use — near 0%. The decoder now always generates from the latent alone.
 
 ---
 
@@ -177,33 +182,7 @@ trained jointly with Pool + Recon. The encoder stays frozen.
 
 ---
 
-### 3.5 PointerGenerator (`use_copy=True`)
-
-A pointer-generator network (See et al., 2017) that controls the decoder's
-output distribution:
-
-```
-attn_t  = softmax(q(h_t) · k(E_src)ᵀ / √d_attn)    over source positions
-ctx_t   = attn_t · E_src                            copy context
-p_gen   = σ(W · [ctx_t ; h_t ; x_t] + b) ∈ (0,1)    the gate
-P(w)    = p_gen · P_vocab(w) + (1-p_gen) · Σ_{i: src_i=w} attn_{t,i}
-```
-
-At each decode step the model can either **generate** from BART's vocabulary
-or **copy** from the source sequence. This matters for code reconstruction
-where identifiers and literals must come back verbatim — copying makes that
-explicit instead of forcing the softmax to memorize every rare token.
-
-The gate's input is the `[ctx; dec_hidden; dec_input_emb]` concatenation
-(3·d_model), matching the checkpoint's `gate.0` shape `(1, 3·768)`.
-
-Active in `decode_loss*` (source = target text being reconstructed) and
-`decode(..., src_texts=...)`. Latent-only `decode` (e.g. EBM sampling)
-skips it.
-
----
-
-### 3.6 `train_decoder=True`
+### 3.5 `train_decoder=True`
 
 Unfreezes the BART decoder (and tied LM head) for joint fine-tuning with
 Pool + Recon. Used by the conv-pool checkpoints. The encoder remains frozen.
@@ -221,8 +200,8 @@ Token-level cross-entropy reconstruction loss:
 L = CE(BART_Dec(Recon(Pool(BART_Enc(A)))), A)
 ```
 
-When `use_copy=True`, the loss is the negative log-likelihood under the
-pointer-generator's copy-augmented distribution instead of plain CE.
+The decoder reconstructs from the latent alone (teacher-forced cross-entropy);
+there is no copy/source term.
 
 ### Dataset
 
@@ -273,7 +252,6 @@ ae = FrozenBartAutoencoder(
     d_ae=None,                         # latent dim (default d_model=768)
     recon_layers=2,                    # attention blocks in Recon
     recon_heads=8,
-    use_copy=False,                    # add PointerGenerator
     train_decoder=False,               # fine-tune BART decoder
 )
 ```
@@ -313,8 +291,7 @@ ce_per_example = ae.decode_loss_per_example(z, target_texts, device, max_length=
 `decode_loss` runs:
 1. `ReconstructionNet(z)` → `z_dec` of shape `(B, K, d_model)`
 2. Tokenize target texts
-3. If `use_copy`: compute copy-augmented log-probs via PointerGenerator, return NLL
-4. Otherwise: feed `z_dec` as encoder output to `bart(...)` with teacher-forced labels
+3. Feed `z_dec` as encoder output to `bart(...)` with teacher-forced labels (plain CE)
 
 ### 5.4 Decoding (generation)
 
@@ -325,13 +302,10 @@ texts = ae.decode(z, max_length=128, num_beams=1)
 
 # Beam search
 texts = ae.decode(z, max_length=128, num_beams=4)
-
-# With copy (requires use_copy=True)
-texts = ae.decode(z, max_length=128, src_texts=source_texts)
 ```
 
-When `use_copy=True` and `src_texts` is supplied, runs a greedy copy-aware
-loop. Otherwise delegates to `bart.generate()`.
+Generation always runs from the latent alone via `bart.generate()` — the same
+path the EBM uses at sampling time.
 
 ### 5.5 Checkpoint I/O
 
@@ -339,11 +313,11 @@ loop. Otherwise delegates to `bart.generate()`.
 # Save
 sd = ae.state_dict_ae()
 # → {"pool": ..., "recon": ..., "d_ae": ..., "pool_type": ...,
-#     "pointer_generator": ... (if use_copy), "decoder": ... (if train_decoder)}
+#     "decoder": ... (if train_decoder)}
 
 # Load
 ae.load_ae(sd)
-# Validates d_ae, pool_type, and pointer_generator presence match the current AE config.
+# Validates d_ae and pool_type match the current AE config.
 ```
 
 See §7 for the full checkpoint format.
@@ -400,7 +374,7 @@ Empirical comparison on GSM8K:
 |-----------|-----------|----------------------|----------|
 | `decoder` | Separate self + cross attn, distinct W_k/W_v | ~0.38 | Smaller datasets, faster convergence |
 | `resampler` | Combined MHA, shared W_k/W_v, gated residuals | ~2.18 | Large-data regime (LD4LG's original target) |
-| `conv` | Depthwise conv + adaptive pool, no queries | — | Code (conv-pool checkpoints with copy) |
+| `conv` | Depthwise conv + adaptive pool, no queries | — | Code (conv-pool checkpoints) |
 
 The "decoder" type's separated attention gives each role its own projection
 space, which matters when data is limited. The "resampler" is architecturally
@@ -415,12 +389,18 @@ Setting `d_ae < d_model` (e.g. 128) shrinks the EBM's diffusion space by
 the same factor — the single most impactful lever for Milestone 2 tractability.
 The recon's up-projection `d_ae → d_model` handles the dimensionality gap.
 
-### 6.5 PointerGenerator
+### 6.5 Why the copy mechanism was removed
 
-For code reconstruction, identifiers and literals appear verbatim in the
-source and must come back out exactly. The PointerGenerator makes this explicit:
-instead of forcing the softmax to memorize every rare token, the model can
-copy from the source via attention. See §3.5 for the formulation.
+A PointerGenerator (See et al., 2017) was tried so the decoder could copy
+identifiers/literals verbatim from a source. It backfired for this pipeline:
+the EBM generates from a latent with **no source available**, so the copy path
+is inert at inference. During AE training the copy source was the gold answer,
+so the decoder learned to copy the target instead of encoding it into the
+latent — the AE's reported pass-rate (~95% MBPP / ~73% HumanEval) was achieved
+*with the answer in hand*, while the latent-only decode the EBM actually uses
+scored ~0%. Because the EBM can never beat the AE's latent-only ceiling, the
+copy head made the AE look good and the EBM impossible to train. Removed; the
+AE is now scored and trained purely on latent-only reconstruction.
 
 ### 6.6 `train_decoder`
 
@@ -442,14 +422,13 @@ Saved via `state_dict_ae()`, loaded via `load_ae()`.
     "d_ae":       int,            # latent dimensionality (for validation)
     "pool_type":  str,            # "decoder" | "resampler" | "conv" (for validation)
     # Optional:
-    "pointer_generator":  state_dict,     # present iff use_copy=True
     "decoder":    state_dict,     # present iff train_decoder=True (BART decoder weights)
 }
 ```
 
-`load_ae()` validates that the checkpoint's `d_ae`, `pool_type`, and
-`pointer_generator` presence match the current AE config. Mismatch raises `ValueError`
-with a message telling you which constructor arg to fix.
+`load_ae()` validates that the checkpoint's `d_ae` and `pool_type` match the
+current AE config. Mismatch raises `ValueError` with a message telling you which
+constructor arg to fix.
 
 Pre-`pool_type` checkpoints default to `"decoder"` for back-compat.
 The fine-tuned decoder weights (`"decoder"` key) are loaded regardless of
@@ -465,7 +444,6 @@ The fine-tuned decoder weights (`"decoder"` key) are loaded regardless of
 | AttentionPool (resampler) | ~7.1M |
 | AttentionPool (conv) | ~4.7M |
 | ReconstructionNet | ~9.4M |
-| PointerGenerator | ~1.2M |
 | BART Decoder (train_decoder=True) | ~62M |
 | **Total (default)** | **~18.9M trainable** |
 | **Total (with recon)** | **~28.4M trainable** |

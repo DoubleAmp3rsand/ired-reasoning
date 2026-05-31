@@ -26,6 +26,8 @@ from __future__ import annotations
 import os
 import random
 import re
+import resource
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -168,28 +170,97 @@ def extract_code(text: str) -> str:
     return text.strip()
 
 
-def _run_python_script(script: str, timeout: float = 5.0) -> tuple[bool, str]:
+_SYSTEMD_RUN = shutil.which("systemd-run")
+_systemd_scope_ok: bool | None = None  # cached probe result
+
+
+def _can_use_systemd_scope() -> bool:
+    """One-time probe: can we open a transient `--user` cgroup scope? Needs a
+    running user systemd manager + session bus. Cached after first call."""
+    global _systemd_scope_ok
+    if _systemd_scope_ok is None:
+        _systemd_scope_ok = False
+        if _SYSTEMD_RUN:
+            try:
+                p = subprocess.run(
+                    [_SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect",
+                     "-p", "MemoryMax=64M", "-p", "TasksMax=8", "--", "true"],
+                    capture_output=True, timeout=10,
+                )
+                _systemd_scope_ok = (p.returncode == 0)
+            except Exception:
+                _systemd_scope_ok = False
+    return _systemd_scope_ok
+
+
+def _run_python_script(
+    script: str, timeout: float = 5.0, mem_limit_gb: float = 2.0, max_tasks: int = 8
+) -> tuple[bool, str]:
     """Execute `script` as a standalone Python file and return (passed, stderr).
 
     `passed` is True iff the subprocess exits 0 within `timeout`. `stderr` is
     a stderr snippet useful for diagnostics; empty on success. Uses a temp
     file rather than `python -c` so tracebacks have real line numbers.
 
-    Safety note: this is *not* a sandbox. It runs arbitrary decoded code with
-    the same privileges as the parent process. Acceptable for offline eval on
-    benchmark corpora (MBPP/HumanEval); do not point it at adversarial input.
+    Containment. A single verification must not be able to multiply itself:
+    `timeout` bounds wall-clock but NOT memory, and a mis-reconstructed
+    prediction can `fork()` (multiprocessing / recursion) to spawn many
+    children that individually respect a per-process cap yet collectively
+    exhaust host RAM. So we bound *this whole invocation's* subtree:
+
+      - `MemoryMax` (cgroup) caps total memory of the program AND anything it
+        spawns — `mem_limit_gb`, set <= 0 to disable.
+      - `TasksMax=max_tasks` (small) stops it spawning more than a handful of
+        processes/threads, i.e. forbids fork bombs while allowing a couple of
+        library threads.
+      - `RuntimeMaxSec` makes *systemd itself* tear the scope down, so a
+        timed-out forking program can't be orphaned and accumulate across
+        calls (the failure mode that previously summed to a host OOM).
+
+    The caller (`verify_code_batch`) caps how many of these run at once, so the
+    eval's total ceiling is `max_workers * mem_limit_gb`, deterministically.
+    When systemd scopes aren't available we fall back to per-process RLIMIT_AS
+    (memory) + RLIMIT_NPROC (no new processes) — weaker (NPROC is per-UID) but
+    still blocks the single-process runaway and most forking.
+
+    Safety note: this is *not* a full sandbox. It runs arbitrary decoded code
+    with the same privileges as the parent process. Acceptable for offline
+    eval on benchmark corpora (MBPP/HumanEval); do not point it at adversarial
+    input.
     """
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, encoding="utf-8"
     ) as f:
         f.write(script)
         path = f.name
+
+    cmd = [sys.executable, path]
+    preexec = None
+    if mem_limit_gb and mem_limit_gb > 0:
+        if _can_use_systemd_scope():
+            cap_mb = max(int(mem_limit_gb * 1024), 64)
+            runtime_max = max(int(timeout) + 2, 2)  # systemd-side teardown backstop
+            cmd = [
+                _SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect",
+                "-p", f"MemoryMax={cap_mb}M", "-p", "MemorySwapMax=0",
+                "-p", f"TasksMax={max_tasks}", "-p", f"RuntimeMaxSec={runtime_max}",
+                "--", *cmd,
+            ]
+        else:
+            nbytes = int(mem_limit_gb * 1024 ** 3)
+
+            def preexec():  # runs in the child, after fork, before exec
+                resource.setrlimit(resource.RLIMIT_AS, (nbytes, nbytes))
+                # Forbid this process from forking — bounds the subtree to 1.
+                resource.setrlimit(resource.RLIMIT_NPROC, (max_tasks, max_tasks))
+
     try:
         r = subprocess.run(
-            [sys.executable, path],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            preexec_fn=preexec,
         )
         ok = (r.returncode == 0)
         err = "" if ok else (r.stderr or "")[-400:]
@@ -205,7 +276,10 @@ def _run_python_script(script: str, timeout: float = 5.0) -> tuple[bool, str]:
             pass
 
 
-def verify_code(pred_text: str, example: dict, timeout: float = 5.0) -> bool:
+def verify_code(
+    pred_text: str, example: dict, timeout: float = 5.0,
+    mem_limit_gb: float = 2.0, max_tasks: int = 8,
+) -> bool:
     """Execute decoded code against the example's test fixture.
 
     `example` carries `_test_script` (str) — a Python source template with a
@@ -219,7 +293,9 @@ def verify_code(pred_text: str, example: dict, timeout: float = 5.0) -> bool:
     # Indent the prediction if the template expects it (rare; default
     # placement is at module top level).
     script = template.replace("{code}", code)
-    ok, _ = _run_python_script(script, timeout=timeout)
+    ok, _ = _run_python_script(
+        script, timeout=timeout, mem_limit_gb=mem_limit_gb, max_tasks=max_tasks
+    )
     return ok
 
 
@@ -228,18 +304,35 @@ def verify_code_batch(
     examples: list[dict],
     timeout: float = 5.0,
     max_workers: int = 4,
+    mem_limit_gb: float = 2.0,
+    max_tasks: int = 8,
 ) -> list[bool]:
-    """Parallel version of `verify_code` over a batch. Each call still forks
-    its own `python` subprocess; a thread pool lets the parent wait on many
-    at once (subprocess.run drops the GIL while blocked on the child).
+    """Verify a batch of decoded programs under a fixed execution budget.
+
+    `max_workers` is a hard ceiling on how many verification subprocesses run
+    at once; entries are evaluated iteratively through that fixed pool rather
+    than fanning out one child per entry. Combined with the per-invocation
+    containment in `_run_python_script` (each program can't fork past
+    `max_tasks` and can't allocate past `mem_limit_gb`), the eval's total
+    resource ceiling is deterministic:
+
+        peak processes <= max_workers * max_tasks
+        peak memory    <= max_workers * mem_limit_gb
+
+    so no reconstruction — however pathological — can OOM the host. This
+    matters because eval runs the *model's generated* code, which (unlike the
+    gold code seen in training) can be arbitrary.
     """
     if not preds:
         return []
     if max_workers <= 1 or len(preds) == 1:
-        return [verify_code(p, e, timeout=timeout) for p, e in zip(preds, examples)]
+        return [verify_code(p, e, timeout=timeout, mem_limit_gb=mem_limit_gb,
+                            max_tasks=max_tasks)
+                for p, e in zip(preds, examples)]
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         return list(ex.map(
-            lambda pe: verify_code(pe[0], pe[1], timeout=timeout),
+            lambda pe: verify_code(pe[0], pe[1], timeout=timeout,
+                                   mem_limit_gb=mem_limit_gb, max_tasks=max_tasks),
             zip(preds, examples),
         ))
 

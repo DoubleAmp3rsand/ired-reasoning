@@ -27,20 +27,18 @@ Optional (off by default; enable per the flags below):
   - decoder-aux(--decoder-aux-weight): CE(decode(x0_hat), gold) on low-t samples.
   - gen-neg    (--gen-neg-weight)    : generator-grounded negative. The MSE/NCE
                  terms shape the energy field with no knowledge of what the
-                 decoder/point-generator actually emits — the energy manifold
-                 does not know the shape of the generator. This term decodes the
-                 NCE-mined latent's clean estimate through the *inference*
-                 (no-copy) generator and, where that decode is wrong, pushes
-                 E(real) + margin < E(refined). The decode/CE is a detached gate;
-                 the gradient comes only from the energy margin (cheap — reuses
-                 the energy the NCE term already computed). Together with the
-                 no-copy fix below it ties the energy minima to the latents the
-                 generator we actually run can decode.
+                 decoder actually emits — the energy manifold does not know the
+                 shape of the generator. This term decodes the NCE-mined latent's
+                 clean estimate through the generator and, where that decode is
+                 wrong, pushes E(real) + margin < E(refined). The decode/CE is a
+                 detached gate; the gradient comes only from the energy margin
+                 (cheap — reuses the energy the NCE term already computed). It
+                 ties the energy minima to the latents the generator we actually
+                 run can decode.
 
-Both decode-grounded terms (decoder-aux, gen-neg) decode through the **no-copy**
-path (`copy=False`), matching `ae.decode(z, src_texts=None)` at EBM inference.
-With copy on, the pointer-generator's source is the gold answer, so CE collapses
-by copying gold verbatim and the EBM gets no usable signal on the latent.
+Both decode-grounded terms (decoder-aux, gen-neg) decode from the latent alone —
+the same `ae.decode(z)` path the EBM uses at inference (the AE has no copy/source
+mechanism; see docs/autoencoder.md).
 """
 from __future__ import annotations
 
@@ -111,9 +109,6 @@ def build_parser():
     p.add_argument("--pool-type", choices=["decoder", "resampler", "conv"], default="decoder",
                    help="Must match the AE checkpoint's pool_type. Auto-overridden "
                         "from the checkpoint's config when present.")
-    p.add_argument("--use-copy", action="store_true",
-                   help="AE has a pointer-generator (point generator) head. Must "
-                        "match the AE checkpoint; auto-overridden from its config.")
     p.add_argument("--d-ae", type=int, default=-1,
                    help="diffusion-space latent dim. Must match the AE checkpoint.")
     p.add_argument("--recon-layers", type=int, default=2)
@@ -384,11 +379,11 @@ def main(argv=None):
 
         # Architecture must match the checkpoint exactly or load_ae raises. The
         # checkpoint's training config is the source of truth, so override the
-        # arch-defining args from it (k, pool_type, d_ae, use_copy) and log any
-        # change. CLI values for these are only a fallback for older checkpoints.
+        # arch-defining args from it (k, pool_type, d_ae) and log any change.
+        # CLI values for these are only a fallback for older checkpoints.
         ck_cfg = ckpt.get("config", {})
         for field, attr in (("k", "k"), ("pool_type", "pool_type"),
-                            ("d_ae", "d_ae"), ("use_copy", "use_copy")):
+                            ("d_ae", "d_ae")):
             if field in ck_cfg and getattr(args, attr) != ck_cfg[field]:
                 r.log(f"  [arch] overriding --{attr.replace('_', '-')} "
                       f"{getattr(args, attr)} → {ck_cfg[field]} (from checkpoint config)")
@@ -404,7 +399,6 @@ def main(argv=None):
             d_ae=d_ae,
             recon_layers=args.recon_layers,
             recon_heads=args.recon_heads,
-            use_copy=args.use_copy,
         ).to(args.device)
         if "ae" in ckpt:
             ae.load_ae(ckpt["ae"])
@@ -460,16 +454,15 @@ def main(argv=None):
         diffusion.train()
 
         if args.decoder_aux_weight > 0:
-            # No-copy CE: matches ae.decode(z, src_texts=None) at EBM inference.
-            # With copy on, the source is the gold answer, so the loss collapses
-            # by copying gold and gives the EBM almost no gradient on the latent.
+            # CE of the latent-only decode against gold — the same path used at
+            # EBM inference, so the gradient reflects what the generator emits.
             def _decoder_loss_fn(x0_hat, texts):
                 return ae.decode_loss(
                     x0_hat, texts, args.device,
-                    max_length=args.max_a_length, copy=False,
+                    max_length=args.max_a_length,
                 )
             diffusion.set_decoder_loss_fn(_decoder_loss_fn)
-            r.log(f"decoder-aux enabled (no-copy): weight={args.decoder_aux_weight} t_max={args.decoder_aux_t_max}")
+            r.log(f"decoder-aux enabled: weight={args.decoder_aux_weight} t_max={args.decoder_aux_t_max}")
 
         if args.rand_neg_weight > 0:
             r.log(
@@ -478,13 +471,12 @@ def main(argv=None):
             )
 
         if args.gen_neg_weight > 0:
-            # No-copy per-example CE: matches ae.decode(z, src_texts=None) used
-            # at EBM inference, so the energy is grounded against the generator
-            # we actually run (not the copy-from-gold path, which collapses CE).
+            # Per-example CE of the latent-only decode, so the energy is grounded
+            # against the generator we actually run at EBM inference.
             def _gen_ce_fn(z_native, texts):
                 return ae.decode_loss_per_example(
                     z_native, texts, args.device,
-                    max_length=args.max_a_length, copy=False,
+                    max_length=args.max_a_length,
                 )
             diffusion.set_gen_ce_fn(_gen_ce_fn)
             r.log(

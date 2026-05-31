@@ -9,16 +9,15 @@
 # MBPP; eval on MBPP test + HumanEval (held-out).
 
 # ── Autoencoder (must match the AE checkpoint) ─────────────────────────────
-# k / pool_type / d_ae / use_copy are AUTO-OVERRIDDEN from the checkpoint's
-# saved config on load — the values below are only a fallback for older
-# checkpoints. Keep them aligned with configs/ae_conv_pg.yaml to avoid surprises.
+# k / pool_type / d_ae are AUTO-OVERRIDDEN from the checkpoint's saved config
+# on load — the values below are only a fallback for older checkpoints. Keep
+# them aligned with configs/ae_conv_pg.yaml to avoid surprises.
 model: facebook/bart-base
-ae_ckpt: hf://roy-W/ired-reasoning/checkpoints/ae_conv_norm_copy2/ae_latest.pt
+ae_ckpt: checkpoints/ae_conv_pg2/ae_latest.pt
 k: 256                       # latent slots (must match AE)
 pool_type: conv              # depthwise-separable conv + adaptive pool (must match AE)
 pool_layers: 2
 pool_heads: 8
-use_copy: true               # AE has a PointerGenerator (point generator) head
 # d_ae: 128                  # diffusion-space dim; -1/unset = full d_model
 recon_layers: 2
 recon_heads: 8

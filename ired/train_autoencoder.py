@@ -80,10 +80,6 @@ def build_parser():
                         "with shared LN + gated residuals (LD4LG-faithful, identity at init). "
                         "'conv' = depthwise-separable 1-D conv scan + adaptive pool to K + "
                         "self-attention encoder (1-D kernel scans the input tensor).")
-    p.add_argument("--use-copy", action="store_true",
-                   help="add a pointer-generator 'point generator' head that lets the "
-                        "decoder copy tokens from the source. Trains via NLL under the "
-                        "copy-augmented distribution; helps verbatim code reconstruction.")
     p.add_argument("--unfreeze-decoder", action="store_true",
                    help="fine-tune the BART decoder (and tied LM head) jointly with the "
                         "pool/recon. The encoder stays frozen. Decoder weights are saved "
@@ -254,8 +250,9 @@ def eval_reconstruction(ae, dataset, mode, device, max_a_length,
         z = ae.encode_to_latents(gold, device, max_length=max_a_length)
         loss = ae.decode_loss(z, gold, device, max_length=max_a_length)
         losses.append(loss.item())
-        # When the AE has a point generator, let it copy from the gold source.
-        preds = ae.decode(z, max_length=max_a_length, num_beams=num_beams, src_texts=gold)
+        # Latent-only decode — the same path the EBM uses at generation time
+        # (no source to copy from). This is the real reconstruction ceiling.
+        preds = ae.decode(z, max_length=max_a_length, num_beams=num_beams)
         # Run all subprocess verifications for this batch in parallel — each
         # call forks `python`; threads wait on them concurrently.
         if mode == "code":
@@ -322,7 +319,6 @@ def _push_checkpoint_to_hub(
         "d_ae": ae.d_ae,
         "recon_layers": len(ae.recon.layers.layers),
         "recon_heads": None,
-        "use_copy": ae.use_copy,
         "train_decoder": ae.train_decoder,
     }
     config_path = os.path.join(save_dir, "config.json")
@@ -347,7 +343,6 @@ def _push_checkpoint_to_hub(
         f"- **Pool type:** `{ae.pool_type}`\n"
         f"- **Latent slots (K):** {ae.k}\n"
         f"- **d_ae:** {ae.d_ae}\n"
-        f"- **PointerGenerator:** {'yes' if ae.use_copy else 'no'}\n"
         f"- **Decoder fine-tuned:** {'yes' if ae.train_decoder else 'no'}\n"
         f"- **Base model:** `{ae.model_name}`\n"
         f"- **Training steps:** {step}\n\n"
@@ -360,7 +355,6 @@ def _push_checkpoint_to_hub(
         f"    k={ae.k},\n"
         f"    pool_type='{ae.pool_type}',\n"
         f"    d_ae={ae.d_ae},\n"
-        f"    use_copy={ae.use_copy},\n"
         f"    train_decoder={ae.train_decoder},\n"
         ")\n"
         "ckpt = torch.load('ae_checkpoint.pt', map_location='cpu')\n"
@@ -429,7 +423,6 @@ def main(argv=None):
             d_ae=d_ae,
             recon_layers=args.recon_layers,
             recon_heads=args.recon_heads,
-            use_copy=args.use_copy,
             train_decoder=args.unfreeze_decoder,
         ).to(args.device)
         ae.train()

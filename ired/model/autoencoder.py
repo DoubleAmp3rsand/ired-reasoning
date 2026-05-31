@@ -39,23 +39,22 @@ Two-phase design, matching LD4LG's compression/reconstruction split:
     │           BART Decoder           BART Decoder             │
     │           (frozen, default)      (fine-tuned)             │
     │                    │          train_decoder=True          │
-    │                    ├── PointerGenerator ──────┤           │
-    │                    │     use_copy=True       │            │
     │                    ▼                         ▼            │
     │                  text                      text           │
     │                                                           │
     └───────────────────────────────────────────────────────────┘
 
-Two knobs on the decode side:
+One knob on the decode side:
 
 - ``train_decoder`` — unfreeze the BART decoder (and tied LM head) and
   fine-tune it jointly with Pool + Recon. Encoder stays frozen. Weights
   saved under the checkpoint ``decoder`` key.
-- ``use_copy`` — add a PointerGenerator (See et al., 2017) that mixes
-  BART's vocabulary distribution with a copy distribution over source tokens
-  via a learned gate ``p_gen``. Active in ``decode_loss*`` (source =
-  reconstructed text) and ``decode(..., src_texts=...)``; latent-only decode
-  (EBM sampling) skips it and relies on the decoder alone.
+
+The decoder always generates from the latent alone — there is no copy/source
+path. (A PointerGenerator copy mechanism was removed: at EBM generation time
+there is no source sequence to copy from, so copying only inflated AE
+reconstruction metrics during training without giving the EBM a usable
+latent-only decoder. See docs/autoencoder.md.)
 
 Three compression patterns, selectable via ``pool_type``
 ----------------------------------------------------------
@@ -101,7 +100,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, BartForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.models.bart.modeling_bart import shift_tokens_right
 
 
 POOL_TYPES = ("decoder", "resampler", "conv")
@@ -370,84 +368,23 @@ class ReconstructionNet(nn.Module):
         return x
 
 
-class PointerGenerator(nn.Module):
-    """Pointer-generator network (See et al., 2017) over the source tokens.
-
-    A "point generator" that controls the decoder's output distribution: at
-    every decode step it can either *generate* a token from the BART vocabulary
-    distribution, or *copy* a token from the source sequence. This matters for
-    code reconstruction, where identifiers / literals appear in the source and
-    must come back out verbatim — copying makes that explicit instead of
-    forcing the softmax to memorize every rare token.
-
-        attn_t   = softmax( q(h_t) · k(E_src)ᵀ / √d_attn )      over source pos.
-        ctx_t    = attn_t · E_src                               copy context
-        p_gen    = σ( W · [ctx_t ; h_t ; x_t] + b ) ∈ (0, 1)    the gate
-        P(w)     = p_gen · P_vocab(w) + (1 − p_gen) · Σ_{i: src_i = w} attn_{t,i}
-
-    where `h_t` is the decoder hidden state, `x_t` the decoder input embedding,
-    and `E_src` the (frozen) encoder hidden states of the source. The gate's
-    `3·d_model` input is exactly the `[ctx ; h ; x]` concatenation, matching
-    the checkpoint's `gate.0` shape (1, 3·768).
-    """
-
-    def __init__(self, d_model: int, attn_dim: int = 256):
-        super().__init__()
-        self.attn_dim = attn_dim
-        self.scale = attn_dim ** -0.5
-        self.q_proj = nn.Linear(d_model, attn_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, attn_dim, bias=False)
-        self.gate = nn.Sequential(nn.Linear(3 * d_model, 1))
-
-    def forward(
-        self,
-        dec_hidden: torch.Tensor,        # (B, T, d) decoder hidden states
-        dec_input_emb: torch.Tensor,     # (B, T, d) decoder input embeddings
-        src_hidden: torch.Tensor,        # (B, L, d) source encoder hidden states
-        src_ids: torch.Tensor,           # (B, L)    source token ids
-        vocab_logits: torch.Tensor,      # (B, T, V) BART LM-head logits
-        src_pad_mask: torch.Tensor | None = None,  # (B, L) True = pad
-    ) -> torch.Tensor:
-        """Returns copy-augmented log-probabilities, shape (B, T, V)."""
-        q = self.q_proj(dec_hidden)                          # (B, T, A)
-        k = self.k_proj(src_hidden)                          # (B, L, A)
-        scores = torch.matmul(q, k.transpose(1, 2)) * self.scale  # (B, T, L)
-        if src_pad_mask is not None:
-            scores = scores.masked_fill(src_pad_mask.unsqueeze(1), float("-inf"))
-        attn = torch.softmax(scores, dim=-1)                 # (B, T, L)
-        ctx = torch.matmul(attn, src_hidden)                 # (B, T, d)
-
-        p_gen = torch.sigmoid(
-            self.gate(torch.cat([ctx, dec_hidden, dec_input_emb], dim=-1))
-        )                                                    # (B, T, 1)
-
-        vocab_probs = torch.softmax(vocab_logits, dim=-1)    # (B, T, V)
-        copy_probs = vocab_probs.new_zeros(vocab_probs.shape)
-        src_index = src_ids.unsqueeze(1).expand(-1, attn.size(1), -1)  # (B, T, L)
-        copy_probs.scatter_add_(-1, src_index, attn)
-
-        final = p_gen * vocab_probs + (1.0 - p_gen) * copy_probs
-        return final.clamp_min(1e-12).log()
-
-
 class FrozenBartAutoencoder(nn.Module):
     """BART autoencoder: encoder always frozen, AttentionPool + ReconstructionNet
-    trainable, decoder optionally fine-tuned, optional PointerGenerator.
+    trainable, decoder optionally fine-tuned.
 
     BART is used over T5 because its byte-level BPE tokenizer preserves all
     whitespace (newlines, tabs, indentation) — required for code reconstruction.
 
     Public API:
       encode_to_latents(texts) -> (B, K, d_ae)              # diffusion-space
-      decode_loss(z, target_texts) -> scalar loss           # CE, or copy-NLL
-      decode(z, num_beams=1, src_texts=None) -> list[str]   # generate from latents
+      decode_loss(z, target_texts) -> scalar loss           # CE
+      decode(z, num_beams=1) -> list[str]                   # generate from latents
 
     Construction knobs:
       d_ae < d_model   make the EBM diffuse in a smaller space; recon up-projects
                        back to d_model for the decoder.
       pool_type        "decoder" | "resampler" | "conv" (see module docstring).
       train_decoder    fine-tune the BART decoder + LM head (encoder stays frozen).
-      use_copy         add a PointerGenerator over the source tokens.
     """
 
     def __init__(
@@ -460,7 +397,6 @@ class FrozenBartAutoencoder(nn.Module):
         d_ae: int | None = None,
         recon_layers: int = 2,
         recon_heads: int = 8,
-        use_copy: bool = False,
         train_decoder: bool = False,
     ):
         super().__init__()
@@ -471,7 +407,6 @@ class FrozenBartAutoencoder(nn.Module):
         self.d_ae = d_ae if d_ae is not None else self.d_model
         self.k = k
         self.pool_type = pool_type
-        self.use_copy = use_copy
         self.train_decoder = train_decoder
 
         self.pool = AttentionPool(
@@ -488,8 +423,6 @@ class FrozenBartAutoencoder(nn.Module):
             n_layers=recon_layers,
             n_heads=recon_heads,
         )
-        # Pointer-generator that controls decoder generation.
-        self.pointer_generator = PointerGenerator(self.d_model) if use_copy else None
 
         self.freeze_bart()
 
@@ -509,8 +442,8 @@ class FrozenBartAutoencoder(nn.Module):
             self.bart.model.decoder.train()
 
     def train(self, mode: bool = True):
-        # Pool + recon (+ pointer generator) toggle to train mode; BART encoder stays in
-        # eval. The decoder follows train mode only when it is being fine-tuned.
+        # Pool + recon toggle to train mode; BART encoder stays in eval. The
+        # decoder follows train mode only when it is being fine-tuned.
         super().train(mode)
         self.bart.eval()
         if self.train_decoder:
@@ -544,18 +477,6 @@ class FrozenBartAutoencoder(nn.Module):
         z = self.pool(enc_hidden, enc_mask)
         return z
 
-    @torch.no_grad()
-    def _encode_source(self, input_ids, attention_mask):
-        """Frozen-encoder pass used as the copy source (E_src in PointerGenerator).
-
-        Detached on purpose: the pointer-generator's q/k projections still
-        receive gradients; the BART encoder behind the source stays frozen.
-        """
-        out = self.bart.get_encoder()(
-            input_ids=input_ids, attention_mask=attention_mask,
-        )
-        return out.last_hidden_state, attention_mask
-
     def encode_to_latents_from_ids(
         self,
         input_ids: torch.Tensor,
@@ -581,9 +502,20 @@ class FrozenBartAutoencoder(nn.Module):
         """Apply f_ψ to map diffusion-space latents back to decoder-input shape."""
         return self.recon(z)
 
-    def _decoder_states(self, z_dec: torch.Tensor, decoder_input_ids: torch.Tensor):
+    def _decoder_states(
+        self, z_dec: torch.Tensor, decoder_input_ids: torch.Tensor,
+        last_only: bool = False,
+    ):
         """Run the BART decoder over the recon latents and return
-        (decoder hidden states, LM-head logits)."""
+        (decoder hidden states, LM-head logits).
+
+        `last_only` keeps just the final position's hidden state before the
+        LM-head projection, so `lm_logits` is (B, 1, V) instead of (B, T, V).
+        Autoregressive generation only needs the last step; projecting the
+        whole prefix to vocab each step is the (B, T, V) memory blow-up that
+        OOMs the unified-memory host. The decoder itself still runs over the
+        full prefix (causal context is required); only the vocab projection
+        is sliced."""
         enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
         encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
         out = self.bart.model(
@@ -593,25 +525,10 @@ class FrozenBartAutoencoder(nn.Module):
             use_cache=False,
         )
         hidden = out.last_hidden_state
+        if last_only:
+            hidden = hidden[:, -1:]
         lm_logits = self.bart.lm_head(hidden) + self.bart.final_logits_bias
         return hidden, lm_logits
-
-    def _copy_log_probs(
-        self,
-        z_dec: torch.Tensor,
-        decoder_input_ids: torch.Tensor,
-        src_ids: torch.Tensor,
-        src_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Copy-augmented log-probabilities (B, T, V) from the point generator."""
-        src_hidden, _ = self._encode_source(src_ids, src_mask)
-        hidden, lm_logits = self._decoder_states(z_dec, decoder_input_ids)
-        embed_scale = getattr(self.bart.model.decoder, "embed_scale", 1.0)
-        dec_emb = self.bart.model.decoder.embed_tokens(decoder_input_ids) * embed_scale
-        return self.pointer_generator(
-            hidden, dec_emb, src_hidden, src_ids, lm_logits,
-            src_pad_mask=~src_mask.bool(),
-        )
 
     def decode_loss(
         self,
@@ -619,43 +536,17 @@ class FrozenBartAutoencoder(nn.Module):
         target_texts,
         device,
         max_length: int = 128,
-        copy: bool | None = None,
     ) -> torch.Tensor:
         """Reconstruction loss. `z` is in diffusion space (B, K, d_ae); recon
-        shapes it to (B, K, d_model) before the decoder reads it.
-
-        With `use_copy`, the loss is the negative log-likelihood under the
-        pointer-generator's copy-augmented distribution (source = the target
-        text being reconstructed). Otherwise it is BART's plain CE.
-
-        `copy` overrides whether the pointer-generator is used: `None` follows
-        `self.use_copy`; `False` forces the plain-CE (no-copy) path even on a
-        copy-equipped AE. The EBM's decoder-aux grounding passes `copy=False`
-        so the CE reflects the same `decode(..., src_texts=None)` path used at
-        EBM inference. With copy on, the source is the gold answer itself, so
-        the gate can drive `p_gen → 0` and copy gold verbatim — CE collapses
-        toward zero regardless of latent quality and the EBM gets no signal."""
-        use_copy = self.use_copy if copy is None else copy
+        shapes it to (B, K, d_model) before the decoder reads it. BART's plain
+        teacher-forced cross-entropy — the decoder reconstructs from the latent
+        alone."""
         z_dec = self._latents_to_decoder_input(z)                   # (B, K, d_model)
 
         target_enc = self._tokenize(target_texts, device, max_length)
         input_ids = target_enc.input_ids
         labels = input_ids.clone()
         labels[labels == self.tokenizer.pad_token_id] = -100
-
-        if use_copy:
-            decoder_input_ids = shift_tokens_right(
-                input_ids, self.tokenizer.pad_token_id,
-                self.bart.config.decoder_start_token_id,
-            )
-            log_probs = self._copy_log_probs(
-                z_dec, decoder_input_ids, input_ids, target_enc.attention_mask,
-            )
-            return F.nll_loss(
-                log_probs.reshape(-1, log_probs.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
-            )
 
         enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
         encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
@@ -677,21 +568,6 @@ class FrozenBartAutoencoder(nn.Module):
         labels = label_ids.clone()
         labels[labels == self.tokenizer.pad_token_id] = -100
 
-        if self.use_copy:
-            src_mask = (label_ids != self.tokenizer.pad_token_id).long()
-            decoder_input_ids = shift_tokens_right(
-                label_ids, self.tokenizer.pad_token_id,
-                self.bart.config.decoder_start_token_id,
-            )
-            log_probs = self._copy_log_probs(
-                z_dec, decoder_input_ids, label_ids, src_mask,
-            )
-            return F.nll_loss(
-                log_probs.reshape(-1, log_probs.size(-1)),
-                labels.reshape(-1),
-                ignore_index=-100,
-            )
-
         enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
         encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
         out = self.bart(
@@ -708,7 +584,6 @@ class FrozenBartAutoencoder(nn.Module):
         target_texts,
         device,
         max_length: int = 128,
-        copy: bool | None = None,
     ) -> torch.Tensor:
         """Per-example teacher-forced CE — returns shape (B,).
 
@@ -716,15 +591,7 @@ class FrozenBartAutoencoder(nn.Module):
         example, so per-example CE can be paired with per-example pass/fail
         for the exposure-bias-gap diagnostic (see docs/exposure_bias.md).
         Pad positions are excluded from each example's mean.
-
-        `copy` overrides whether the pointer-generator is used: `None` follows
-        `self.use_copy`; `False` forces the plain-CE (no-copy) path even on a
-        copy-equipped AE. The EBM's generator-grounding gate passes `copy=False`
-        so the CE reflects the same `decode(..., src_texts=None)` path used at
-        EBM inference — not the copy-from-gold path, which collapses CE toward
-        zero regardless of latent quality.
         """
-        use_copy = self.use_copy if copy is None else copy
         z_dec = self._latents_to_decoder_input(z)
         target_enc = self._tokenize(target_texts, device, max_length)
         input_ids = target_enc.input_ids
@@ -732,37 +599,21 @@ class FrozenBartAutoencoder(nn.Module):
         pad_mask = (labels == self.tokenizer.pad_token_id)
         labels[pad_mask] = -100
 
-        if use_copy:
-            decoder_input_ids = shift_tokens_right(
-                input_ids, self.tokenizer.pad_token_id,
-                self.bart.config.decoder_start_token_id,
-            )
-            log_probs = self._copy_log_probs(
-                z_dec, decoder_input_ids, input_ids, target_enc.attention_mask,
-            )
-            B, L, V = log_probs.shape
-            ce = F.nll_loss(
-                log_probs.reshape(-1, V),
-                labels.reshape(-1),
-                ignore_index=-100,
-                reduction="none",
-            ).reshape(B, L)
-        else:
-            enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
-            encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
-            out = self.bart(
-                encoder_outputs=encoder_outputs,
-                attention_mask=enc_attn,
-                labels=labels,
-            )
-            logits = out.logits  # (B, L, V); BART shifts labels internally
-            B, L, V = logits.shape
-            ce = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, V),
-                labels.reshape(-1),
-                ignore_index=-100,
-                reduction="none",
-            ).reshape(B, L)
+        enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
+        encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
+        out = self.bart(
+            encoder_outputs=encoder_outputs,
+            attention_mask=enc_attn,
+            labels=labels,
+        )
+        logits = out.logits  # (B, L, V); BART shifts labels internally
+        B, L, V = logits.shape
+        ce = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, V),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape(B, L)
         valid = (~pad_mask).float()
         return (ce * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
 
@@ -772,22 +623,16 @@ class FrozenBartAutoencoder(nn.Module):
         z: torch.Tensor,
         max_length: int = 128,
         num_beams: int = 1,
-        src_texts=None,
     ) -> list[str]:
         """Decode from continuous latents. `z` is in diffusion space (B, K, d_ae);
         recon expands to (B, K, d_model). `num_beams=1` is greedy; >1 enables
         beam search, which usually lifts code pass-rate when per-token loss is
         in the 0.2–1.0 nat range (right token often #2/#3, not #1).
 
-        When the AE has a point generator (`use_copy`) **and** `src_texts` is
-        supplied, generation runs a copy-aware greedy loop so the decoder may
-        copy tokens straight from the source. Latent-only callers (e.g. EBM
-        sampling) leave `src_texts=None`, in which case the fine-tuned decoder
-        generates on its own via `bart.generate`."""
+        The decoder generates from the latent alone (`bart.generate`) — the same
+        path used at EBM sampling time."""
         self.bart.eval()
         z_dec = self._latents_to_decoder_input(z)
-        if self.use_copy and src_texts is not None:
-            return self._decode_with_copy(z_dec, src_texts, max_length)
 
         enc_attn = torch.ones(z_dec.shape[:2], dtype=torch.long, device=z_dec.device)
         encoder_outputs = BaseModelOutput(last_hidden_state=z_dec)
@@ -800,57 +645,27 @@ class FrozenBartAutoencoder(nn.Module):
         )
         return self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
 
-    @torch.no_grad()
-    def _decode_with_copy(self, z_dec, src_texts, max_length) -> list[str]:
-        """Greedy decode under the pointer-generator distribution, copying from
-        the encoded `src_texts`."""
-        device = z_dec.device
-        src_enc = self._tokenize(src_texts, device, max_length)
-        src_ids, src_mask = src_enc.input_ids, src_enc.attention_mask
-
-        b = z_dec.size(0)
-        pad_id = self.tokenizer.pad_token_id
-        eos_id = self.bart.config.eos_token_id
-        start_id = self.bart.config.decoder_start_token_id
-        dec_ids = torch.full((b, 1), start_id, dtype=torch.long, device=device)
-        finished = torch.zeros(b, dtype=torch.bool, device=device)
-
-        for _ in range(max_length - 1):
-            log_probs = self._copy_log_probs(z_dec, dec_ids, src_ids, src_mask)
-            nxt = log_probs[:, -1].argmax(dim=-1)            # (B,)
-            nxt = torch.where(finished, torch.full_like(nxt, pad_id), nxt)
-            dec_ids = torch.cat([dec_ids, nxt.unsqueeze(1)], dim=1)
-            finished |= nxt == eos_id
-            if bool(finished.all()):
-                break
-        return self.tokenizer.batch_decode(dec_ids, skip_special_tokens=True)
-
     # ------------------------------------------------------------------
     # checkpoint helpers
     # ------------------------------------------------------------------
     def trainable_parameters(self):
         params = list(self.pool.parameters()) + list(self.recon.parameters())
-        if self.pointer_generator is not None:
-            params += list(self.pointer_generator.parameters())
         if self.train_decoder:
             params += list(self.bart.model.decoder.parameters())
         return params
 
     def state_dict_ae(self) -> dict:
-        """Save format: {pool, recon, d_ae, pool_type, [pointer_generator], [decoder]}.
+        """Save format: {pool, recon, d_ae, pool_type, [decoder]}.
 
         pool + recon are always saved together (trained jointly). The optional
-        `pointer_generator` and fine-tuned `decoder` weights are included only
-        when those features are active, so checkpoints stay back-compatible with
-        the load path."""
+        fine-tuned `decoder` weights are included only when `train_decoder` is
+        active, so checkpoints stay back-compatible with the load path."""
         sd = {
             "pool":      self.pool.state_dict(),
             "recon":     self.recon.state_dict(),
             "d_ae":      self.d_ae,
             "pool_type": self.pool_type,
         }
-        if self.pointer_generator is not None:
-            sd["pointer_generator"] = self.pointer_generator.state_dict()
         if self.train_decoder:
             sd["decoder"] = self.bart.model.decoder.state_dict()
         return sd
@@ -869,17 +684,8 @@ class FrozenBartAutoencoder(nn.Module):
                 f"checkpoint has pool_type={saved_pool_type!r} but this AE was "
                 f"built with pool_type={self.pool_type!r}. Construct to match."
             )
-        has_pg = "pointer_generator" in state_dict
-        if has_pg != (self.pointer_generator is not None):
-            raise ValueError(
-                f"checkpoint {'has' if has_pg else 'lacks'} a pointer_generator but "
-                f"this AE was built with use_copy={self.pointer_generator is not None}. "
-                "Construct with matching use_copy and retry."
-            )
         self.pool.load_state_dict(state_dict["pool"])
         self.recon.load_state_dict(state_dict["recon"])
-        if has_pg:
-            self.pointer_generator.load_state_dict(state_dict["pointer_generator"])
         # Fine-tuned decoder weights, if the checkpoint carried them. Loaded into
         # the BART decoder regardless of train_decoder so reconstruction matches.
         if "decoder" in state_dict:

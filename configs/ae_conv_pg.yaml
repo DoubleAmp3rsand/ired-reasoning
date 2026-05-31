@@ -1,4 +1,4 @@
-# Autoencoder training config — conv pool + PointerGenerator + unfrozen decoder
+# Autoencoder training config — conv pool + unfrozen decoder
 #
 # Launch:  uv run python -m ired.train_autoencoder --config configs/ae_conv_pg.yaml
 # CLI args override config values, so e.g. `--seed 42` on the command line
@@ -8,7 +8,7 @@
 model: facebook/bart-base   # base | large (diffusion space grows with d_ae, so large is costly)
 
 # ── AttentionPool (f_φ) ────────────────────────────────────────────────
-k: 256                       # latent slots
+k: 384                       # latent slots (increased for longer max_a_length)
 pool_layers: 2
 pool_heads: 8
 pool_type: conv              # depthwise-separable conv + adaptive pool
@@ -19,7 +19,6 @@ recon_layers: 2
 recon_heads: 8
 
 # ── Decode-side knobs ──────────────────────────────────────────────────
-use_copy: true               # PointerGenerator over source tokens
 unfreeze_decoder: true       # fine-tune BART decoder jointly (matches the ae_conv_norm_copy2 reference)
 decoder_lr: 1.0e-5           # separate (smaller) LR for decoder params
 
@@ -35,7 +34,7 @@ code_samples: 60000          # CodeSearchNet fns to materialize
 code_min_chars: 100
 code_max_chars: 4000
 
-mixed_length: 160000         # virtual length of mixed OWT+code dataset
+mixed_length: 200000         # virtual length of mixed OWT+code dataset
 
 # ── Optimization ───────────────────────────────────────────────────────
 batch_size: 64
@@ -45,12 +44,12 @@ weight_decay: 0.01
 warmup_steps: 500
 min_lr_ratio: 0.1            # cosine floor as fraction of lr
 
-steps: 15000                 # total optimizer steps
+steps: 20000                 # total optimizer steps (more steps for larger K/longer seqs)
 log_every: 50                # steps between log lines
 eval_every: 1000             # steps between eval cycles
 
 # ── Eval ───────────────────────────────────────────────────────────────
-max_a_length: 256            # tokenizer truncation cap
+max_a_length: 512            # tokenizer truncation cap (was 256; 41.5% of HumanEval truncated at 256)
 eval_n_examples: 64          # per-dataset examples each eval
 eval_beams: 4                # beam width for code eval (OWT stays greedy)
 
@@ -59,7 +58,7 @@ num_workers: 4
 seed: 0
 device: cuda                 # cuda | cpu
 tui: true                    # Rich+plotext TUI (graphs + scrolling log)
-save_dir: checkpoints/ae_conv_pg
+save_dir: checkpoints/ae_conv_pg2
 
 # ── HuggingFace Hub (optional) ─────────────────────────────────────────
 push_to_hub: true
