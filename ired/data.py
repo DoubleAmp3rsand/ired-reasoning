@@ -1,25 +1,47 @@
 """Dataset loaders for the IRED reasoning project.
 
-Four corpora live here:
+The task substrate is **text-to-SQL**, not Python. Measured vanilla-AE
+round-trip floors (`scripts/{bart,sql}_reconstruction_baseline.py`) showed
+the frozen autoencoder cannot reconstruct Python at all — its dominant
+failure is whitespace/newline collapse, and Python whitespace is syntax, so
+every drift is fatal (bart-base MBPP/HumanEval: 0% exact, CER ~0.9). SQL is
+whitespace- and case-insensitive, so the same AE mangling is harmless: the
+*untrained* bart-base floor on Spider is already 44% normalized-exact / 0.16
+CER. That gap is why the structured-generation target moved from code to SQL —
+it keeps an external execution verifier and a high-volume latent while
+dropping the surface form the AE can't preserve.
+
+Natural-language / code corpora (AE pretraining mix):
 
 - `OpenWebTextDataset` — generic natural-language pretraining corpus for the
   frozen-BART autoencoder.
-- `CodeSearchNetDataset` — Python functions with docstrings, scraped from
-  GitHub in 2019. Predates both MBPP (2021) and HumanEval (2021), so
-  contamination of the EBM eval sets is structurally impossible. Used as a
-  code-domain slice in the AE pretraining mix.
-- `MBPPDataset` — Mostly Basic Python Problems. Each example is a natural-
-  language task description plus a canonical Python solution and a list of
-  `assert` tests. Primary EBM-training corpus.
-- `HumanEvalDataset` — OpenAI's HumanEval. Function signature + docstring as
-  the prompt; canonical body + a `check(candidate)` test fixture as the
-  verifier. Held-out eval corpus.
+- `CodeSearchNetDataset` — Python functions, GitHub 2019 scrape. Legacy code
+  slice; retained but no longer the primary domain.
 
-The EBM is trained on MBPP (or a `MixedDataset` if more sources are added)
-and evaluated on MBPP test + HumanEval separately so per-corpus
-generalization is visible. Correctness goes through `verify_code`, which
-executes the decoded answer against the per-example test fixture in a
-subprocess with a timeout.
+Text-to-SQL corpora (the current task):
+
+- `GretelText2SQLDataset` — `gretelai/synthetic_text_to_sql`, 100k fully
+  *synthetic* NL→SQL pairs across ~100 domains. **AE-training SQL source**,
+  mixed 50/50 with OpenWebText. Synthetic generation (Gretel Navigator) over
+  disjoint database schemas means it shares no examples with Spider's
+  human-annotated corpus — example-level contamination of the eval set is
+  structurally ruled out, the same guarantee CodeSearchNet got from its 2019
+  temporal cutoff.
+- `SpiderText2SQLDataset` — Yale's Spider, human-annotated NL→SQL over 200
+  databases. **Held-out eval source.** The AE never trains on it, preserving
+  the gensis §2.2 anchoring property (the latent space is not shaped by the
+  eval distribution).
+
+Legacy Python task corpora (kept for the code-execution path / ablations):
+
+- `MBPPDataset`, `HumanEvalDataset` — execution-verified Python benchmarks.
+
+SQL reconstruction is scored with `normalize_sql` + `sql_match_batch`
+(whitespace/case-insensitive string match — the correctness-relevant
+comparison for SQL). Python correctness still goes through `verify_code`,
+which executes the decoded answer against a per-example test fixture in a
+contained subprocess. Execution accuracy against the Spider databases
+(result-set equality) is the eventual hard SQL metric and is not yet wired.
 """
 from __future__ import annotations
 
@@ -28,9 +50,12 @@ import random
 import re
 import resource
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -67,7 +92,6 @@ class OpenWebTextDataset(Dataset):
             "Skylion007/openwebtext",
             split="train",
             streaming=True,
-            trust_remote_code=True,
         )
         # Streaming datasets support .shuffle with a buffer; this isn't a true
         # global shuffle but is enough to avoid topic-clustered batches.
@@ -473,6 +497,594 @@ class HumanEvalDataset(Dataset):
             })
             if max_samples is not None and len(self.examples) >= max_samples:
                 break
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[int(idx)]
+
+
+# ---------------------------------------------------------------------------
+# Text-to-SQL — primary task substrate
+# ---------------------------------------------------------------------------
+
+_SQL_WS_RE = re.compile(r"\s+")
+
+
+def normalize_sql(s: str) -> str:
+    """Lowercase + collapse all whitespace runs to a single space, stripped.
+
+    Captures the formatting freedom SQL correctness tolerates: keywords are
+    case-insensitive and whitespace between tokens is irrelevant, so a
+    reconstruction that differs only in case/spacing is still the same query.
+    String/identifier case can matter in principle, so normalized-exact is an
+    upper-bound proxy for correctness — pair it with raw exact (lower bound)
+    and, eventually, execution accuracy (the ground truth).
+    """
+    return _SQL_WS_RE.sub(" ", s).strip().lower()
+
+
+def sql_match(pred: str, gold: str, normalize: bool = True) -> bool:
+    """Reconstruction match for a single (pred, gold) SQL pair."""
+    if normalize:
+        return normalize_sql(pred) == normalize_sql(gold)
+    return pred.strip() == gold.strip()
+
+
+def sql_match_batch(
+    preds: list[str], golds: list[str], normalize: bool = True
+) -> list[bool]:
+    """Batch SQL reconstruction match — the SQL analog of `verify_code_batch`.
+
+    Returns one bool per pair. `normalize=True` (default) is the
+    whitespace/case-insensitive comparison that tracks SQL correctness; set
+    `normalize=False` for raw byte-exact. (No subprocess: a string compare is
+    enough until execution-against-the-DB accuracy is wired, at which point a
+    `verify_sql_batch` mirroring `verify_code_batch` will live here.)
+    """
+    return [sql_match(p, g, normalize=normalize) for p, g in zip(preds, golds)]
+
+
+class GretelText2SQLDataset(Dataset):
+    """`gretelai/synthetic_text_to_sql` — synthetic NL→SQL, the AE-training
+    SQL source.
+
+    100k fully synthetic examples (generated by Gretel Navigator) spanning
+    ~100 domains with schema context. Because the queries are model-generated
+    over synthetic schemas — never sourced from Spider's human-annotated
+    databases — there is no example-level overlap with the Spider eval set:
+    contamination is ruled out by construction, the structural analog of
+    CodeSearchNet's 2019-vs-2021 temporal cutoff.
+
+    Mixed 50/50 with `OpenWebTextDataset` to teach the frozen-BART autoencoder
+    SQL surface structure without ever showing it the eval distribution
+    (gensis §2.2 anchoring).
+
+    Field mapping:
+      - `answer`   = the `sql` query — the text the AE round-trips.
+      - `question` = `sql_prompt`, the NL request (unused by the AE; the EBM's
+        conditioning later).
+      - `_schema`  = `sql_context` (CREATE TABLE + seed rows), kept for future
+        schema-grounded conditioning / execution.
+
+    Unlike the prose/code corpora, over-long entries are **skipped, not
+    truncated** — truncating mid-query yields invalid SQL, which would poison
+    both reconstruction targets and any future execution check.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        max_samples: int = 50_000,
+        min_chars: int = 20,
+        max_chars: int = 1_000,
+        seed: int = 0,
+    ):
+        ds = load_dataset("gretelai/synthetic_text_to_sql", split=split)
+        ds = ds.shuffle(seed=seed)
+        self.examples: list[dict] = []
+        for ex in ds:
+            sql = (ex.get("sql") or "").strip()
+            if len(sql) < min_chars or len(sql) > max_chars:
+                continue
+            self.examples.append({
+                "question": (ex.get("sql_prompt") or "").strip(),
+                "answer": sql,
+                "_schema": (ex.get("sql_context") or "").strip(),
+                "_domain": ex.get("domain"),
+            })
+            if max_samples is not None and len(self.examples) >= max_samples:
+                break
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[int(idx)]
+
+
+class SpiderText2SQLDataset(Dataset):
+    """Yale Spider — human-annotated NL→SQL, the held-out eval source.
+
+    HuggingFace `spider`: train=7000, validation=1034, over 200 databases /
+    138 domains. We use the validation split as the AE/EBM eval corpus and
+    never train the AE on it (anchoring, gensis §2.2). Independent of the
+    synthetic Gretel training source (different provenance, disjoint schemas),
+    so reconstruction here is genuine held-out generalization.
+
+    Field mapping:
+      - `answer`   = `query`, the gold SQL the AE must round-trip.
+      - `question` = the NL `question`.
+      - `_db_id`   = the database id, needed for the eventual execution
+        verifier (run pred vs gold against the DB, compare result sets).
+
+    Over-long queries are skipped rather than truncated (invalid-SQL guard),
+    same as the Gretel source.
+    """
+
+    def __init__(
+        self,
+        split: str = "validation",
+        max_samples: int | None = None,
+        min_chars: int = 10,
+        max_chars: int = 1_000,
+        seed: int = 0,
+    ):
+        assert split in ("train", "validation")
+        ds = load_dataset("spider", split=split)
+        ds = ds.shuffle(seed=seed)
+        self.examples: list[dict] = []
+        for ex in ds:
+            query = (ex.get("query") or "").strip()
+            question = (ex.get("question") or "").strip()
+            if not query or not question:
+                continue
+            if len(query) < min_chars or len(query) > max_chars:
+                continue
+            self.examples.append({
+                "question": question,
+                "answer": query,
+                "_db_id": ex.get("db_id"),
+            })
+            if max_samples is not None and len(self.examples) >= max_samples:
+                break
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[int(idx)]
+
+
+# ---------------------------------------------------------------------------
+# Spider execution verifier — result-set equality against the real databases
+# ---------------------------------------------------------------------------
+
+# The HF `spider` dataset ships only queries/questions; the SQLite databases
+# come from this mirror of the official Spider release (data.zip, ~105 MB,
+# contains database/<db_id>/<db_id>.sqlite).
+_SPIDER_DB_REPO = "SALT-NLP/spider_VALUE"
+_SPIDER_DB_FILE = "data.zip"
+_ORDER_BY_RE = re.compile(r"\border\s+by\b", re.IGNORECASE)
+
+
+def _spider_first_statement(sql: str) -> str:
+    """First SQL statement, stripped of a trailing semicolon.
+
+    Spider gold and (almost all) model predictions are a single statement;
+    splitting on the first ';' guards against a stray trailing statement
+    confusing sqlite3 (one statement per `execute`). Semicolons inside string
+    literals are rare here and accepted as a known limitation.
+    """
+    s = sql.strip()
+    if ";" in s:
+        s = s.split(";", 1)[0]
+    return s.strip()
+
+
+def _canon_cell(c):
+    """Canonicalize one result cell so trivially-equal values compare equal."""
+    if isinstance(c, bytes):
+        return c.decode("utf-8", "replace")
+    if isinstance(c, float):
+        # Collapse int-valued floats and fp noise so 3, 3.0, 2.9999999 agree.
+        return round(c, 6)
+    return c
+
+
+def _canon_rows(rows, ordered: bool):
+    """Comparable form of a result set: multiset of canonical row-tuples,
+    order-sensitive only when the gold query had an ORDER BY."""
+    canon = [tuple(_canon_cell(c) for c in row) for row in rows]
+    return canon if ordered else sorted(canon, key=repr)
+
+
+class SpiderExecutionVerifier:
+    """Execution-accuracy verifier for Spider SQL.
+
+    Runs the predicted and gold queries against the **real** Spider SQLite
+    database for the example and compares result sets ("table differences").
+    A prediction passes iff it executes without error and returns the same
+    result set as the gold; an invalid/erroring prediction fails.
+
+    Lifecycle (mirrors the training eval loop; see `train_autoencoder`):
+
+        v = SpiderExecutionVerifier()        # once at training start: fetch DBs
+        ...
+        v.setup(db_ids)                       # at each eval-loop entry: POPULATE
+        results = v.verify_batch(preds, batch)
+        v.teardown()                          # at eval-loop exit: DEPOPULATE
+
+    POPULATE loads each needed database from disk into a persistent in-memory
+    SQLite connection (the "template"). Each query then runs against a *fresh
+    clone* of that template, so a destructive prediction (`DROP`/`DELETE`/
+    `UPDATE` — model output is arbitrary) can only corrupt a throwaway copy,
+    never the on-disk file or another example. DEPOPULATE closes every
+    in-memory connection so the databases don't sit in RAM between evals.
+
+    Comparison is the standard execution-match proxy: rows compared as a
+    multiset (order-insensitive) unless the gold has `ORDER BY` (then ordered).
+    Column order is compared as-is — the full Spider test-suite's
+    column-permutation handling is not reproduced, so this is a slight
+    under-count, not an over-count. Unverifiable examples (missing DB file, or
+    a gold query that itself errors) return `None` and are excluded from the
+    pass/total denominator rather than scored as failures.
+
+    Safety: runs arbitrary model SQL in-process against an in-memory copy with
+    a watchdog `interrupt()` timeout and a fetched-row cap. It cannot corrupt
+    disk, but it is not a CPU/RAM sandbox — fine for offline Spider eval.
+    """
+
+    def __init__(self, db_root: str | None = None, timeout: float = 5.0,
+                 max_rows: int = 100_000, cache_dir: str | None = None):
+        self.timeout = timeout
+        self.max_rows = max_rows
+        self.cache_dir = cache_dir or os.path.expanduser("~/.cache/ired_spider")
+        self.db_root = db_root or self._ensure_dbs()
+        self._templates: dict[str, sqlite3.Connection] = {}
+        self._gold_cache: dict[tuple, object] = {}
+        self.missing: set[str] = set()
+
+    # -- database sourcing --------------------------------------------------
+    def _ensure_dbs(self) -> str:
+        """Download + extract the Spider SQLite databases once; return the
+        `database/` root. Cached under `cache_dir`."""
+        extracted = os.path.join(self.cache_dir, "extracted")
+        db_root = self._find_db_root(extracted)
+        if db_root:
+            return db_root
+        from huggingface_hub import hf_hub_download
+        os.makedirs(self.cache_dir, exist_ok=True)
+        zpath = hf_hub_download(_SPIDER_DB_REPO, _SPIDER_DB_FILE,
+                                repo_type="dataset", local_dir=self.cache_dir)
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(extracted)
+        db_root = self._find_db_root(extracted)
+        if not db_root:
+            raise RuntimeError(f"Spider databases not found after extracting {zpath}")
+        return db_root
+
+    @staticmethod
+    def _find_db_root(extracted: str) -> str | None:
+        if not os.path.isdir(extracted):
+            return None
+        for dirpath, dirnames, _ in os.walk(extracted):
+            if os.path.basename(dirpath) == "database" and dirnames:
+                return dirpath
+        return None
+
+    def _db_path(self, db_id: str) -> str:
+        return os.path.join(self.db_root, db_id, f"{db_id}.sqlite")
+
+    # -- populate / depopulate ---------------------------------------------
+    def setup(self, db_ids) -> None:
+        """Load each unique db_id into a persistent in-memory template DB."""
+        self.missing.clear()
+        for db_id in set(db_ids):
+            if not db_id or db_id in self._templates:
+                continue
+            path = self._db_path(db_id)
+            if not os.path.isfile(path):
+                self.missing.add(db_id)
+                continue
+            src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            mem = sqlite3.connect(":memory:")
+            src.backup(mem)
+            src.close()
+            self._templates[db_id] = mem
+
+    def teardown(self) -> None:
+        for con in self._templates.values():
+            try:
+                con.close()
+            except Exception:
+                pass
+        self._templates.clear()
+        self._gold_cache.clear()
+        self.missing.clear()
+
+    # -- execution ----------------------------------------------------------
+    def _clone(self, db_id: str) -> sqlite3.Connection:
+        dst = sqlite3.connect(":memory:")
+        dst.text_factory = lambda b: b.decode("utf-8", "replace")
+        self._templates[db_id].backup(dst)
+        return dst
+
+    def _execute(self, conn: sqlite3.Connection, sql: str):
+        """(ok, rows) — run one statement with an interrupt timeout + row cap."""
+        sql = _spider_first_statement(sql)
+        if not sql:
+            return False, None
+        timer = threading.Timer(self.timeout, conn.interrupt)
+        timer.start()
+        try:
+            cur = conn.execute(sql)
+            return True, cur.fetchmany(self.max_rows)
+        except Exception:
+            return False, None
+        finally:
+            timer.cancel()
+
+    def _gold_result(self, db_id: str, gold: str, ordered: bool):
+        key = (db_id, gold)
+        if key not in self._gold_cache:
+            con = self._clone(db_id)
+            try:
+                ok, rows = self._execute(con, gold)
+            finally:
+                con.close()
+            self._gold_cache[key] = _canon_rows(rows, ordered) if ok else None
+        return self._gold_cache[key]
+
+    def verify_one(self, pred: str, gold: str, db_id: str):
+        """True/False pass, or None when the example can't be judged."""
+        if not db_id or db_id not in self._templates:
+            return None                       # missing DB -> unverifiable
+        ordered = bool(_ORDER_BY_RE.search(gold))
+        gold_canon = self._gold_result(db_id, gold, ordered)
+        if gold_canon is None:
+            return None                       # gold itself errored -> unjudgeable
+        con = self._clone(db_id)
+        try:
+            ok, rows = self._execute(con, pred)
+        finally:
+            con.close()
+        if not ok:
+            return False                      # invalid / erroring prediction
+        return _canon_rows(rows, ordered) == gold_canon
+
+    def verify_batch(self, preds: list[str], batch: list[dict]):
+        """`preds` paired with `batch` (Spider example dicts carrying `_db_id`
+        and gold `answer`). Returns list[bool | None] — None = excluded."""
+        return [
+            self.verify_one(p, ex.get("answer", ""), ex.get("_db_id"))
+            for p, ex in zip(preds, batch)
+        ]
+
+
+# ---------------------------------------------------------------------------
+# ZebraLogic — natural-language logic-grid puzzles (the current eval target)
+# ---------------------------------------------------------------------------
+#
+# Why ZebraLogic over SQL: the AE round-trip is the binding ceiling for any
+# execution-graded structured target (vanilla bart-base on Spider already beats
+# the trained AE on exec-acc — the lossy latent drops the load-bearing tokens
+# SQL needs and copy/schema tricks would hollow the latent the EBM conditions
+# on). ZebraLogic keeps the two properties we need — an irreducibly
+# *natural-language* problem (so the language AE is load-bearing, not a wrapper
+# over a one-hot grid the way IRED's original CSP encoders were) and an exactly
+# *verifiable* answer — while the answer's surface is low-entropy, fixed-format,
+# and built from OWT-frequent common nouns, exactly the regime the frozen-anchor
+# AE reconstructs well. It is, in effect, "Sudoku stated in English."
+#
+# Answer serialization: one line per house, `House <n>: Attr=val, Attr=val, …`.
+# Fixed structure + small vocab → AE-friendly; trivially re-parseable for the
+# exact-match verifier. (Values are assumed comma-free, which holds for the
+# ZebraLogic value pools; a stray comma inside a value is a known limitation.)
+
+_ZEBRA_LINE_RE = re.compile(r"house\s+(\w+)\s*:\s*(.*)", re.IGNORECASE)
+
+
+def zebra_normalize(s) -> str:
+    """Collapse whitespace + lowercase — the cell-comparison canonical form."""
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+def serialize_zebra_solution(solution: dict) -> str:
+    """Gold solution dict ({header, rows}) → canonical answer string.
+
+    `header[0]` is always "House" and `row[0]` the house number; the remaining
+    columns are the attribute categories and their assigned values.
+    """
+    header = solution["header"]
+    attrs = header[1:]
+    lines = []
+    for row in solution["rows"]:
+        house = str(row[0]).strip()
+        cells = ", ".join(
+            f"{a}={str(v).strip()}" for a, v in zip(attrs, row[1:])
+        )
+        lines.append(f"House {house}: {cells}")
+    return "\n".join(lines)
+
+
+def parse_zebra_solution(text: str):
+    """Decoded answer string → {house: {attr: value}} (all normalized), or
+    None if nothing parseable was found. Tolerant of attribute reordering and
+    extra/missing whitespace — only the (house, attr)→value mapping matters."""
+    mapping: dict[str, dict[str, str]] = {}
+    for line in text.splitlines():
+        m = _ZEBRA_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        house = zebra_normalize(m.group(1))
+        cells: dict[str, str] = {}
+        for part in m.group(2).split(","):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            cells[zebra_normalize(k)] = zebra_normalize(v)
+        if cells:
+            mapping[house] = cells
+    return mapping or None
+
+
+def zebra_gold_mapping(solution: dict) -> dict[str, dict[str, str]]:
+    header = solution["header"]
+    attrs = header[1:]
+    mapping: dict[str, dict[str, str]] = {}
+    for row in solution["rows"]:
+        house = zebra_normalize(row[0])
+        mapping[house] = {
+            zebra_normalize(a): zebra_normalize(v)
+            for a, v in zip(attrs, row[1:])
+        }
+    return mapping
+
+
+def zebra_match(pred_text: str, gold_solution: dict) -> bool:
+    """Puzzle-level exact match: every gold (house, attr) cell must be present
+    and equal in the decoded answer. ZebraLogic solutions are unique, so this
+    all-or-nothing check *is* the correctness metric (an unparseable or
+    partially-correct grid is not a solved puzzle)."""
+    gold = zebra_gold_mapping(gold_solution)
+    pred = parse_zebra_solution(pred_text)
+    if not pred:
+        return False
+    for house, cells in gold.items():
+        pcells = pred.get(house)
+        if pcells is None:
+            return False
+        for attr, val in cells.items():
+            if pcells.get(attr) != val:
+                return False
+    return True
+
+
+def zebra_match_batch(preds: list[str], batch: list[dict]) -> list[bool]:
+    """`preds` paired with ZebraLogic example dicts carrying `_solution`."""
+    return [zebra_match(p, ex["_solution"]) for p, ex in zip(preds, batch)]
+
+
+class ZebraLogicVerifier:
+    """Exact-match verifier for ZebraLogic grid solutions.
+
+    Unlike `SpiderExecutionVerifier` there is no database/in-memory lifecycle:
+    the unique gold solution ships with every example, so verification is a
+    pure structural comparison of the decoded assignment against the gold grid.
+    Kept as a class for interface parity with the SQL path (the train loop
+    calls `verify_batch(preds, batch)`), and as the seat for future partial
+    cell-accuracy scoring."""
+
+    def verify_one(self, pred: str, solution: dict) -> bool:
+        return zebra_match(pred, solution)
+
+    def verify_batch(self, preds: list[str], batch: list[dict]) -> list[bool]:
+        return [self.verify_one(p, ex["_solution"]) for p, ex in zip(preds, batch)]
+
+
+class ZebraLogicDataset(Dataset):
+    """`WildEval/ZebraLogic` (grid_mode) — 1000 NL logic-grid puzzles, 2×2 to
+    6×6, programmatically generated with a unique solution. The **held-out eval
+    target**: the AE never trains on it (anchoring, gensis §2.2).
+
+    Note the `allenai/ZebraLogicBench` mirror ships the solution **redacted**
+    (`___`) as a leaderboard guard — we load `WildEval/ZebraLogic`, which keeps
+    the gold grid, and still skip any redacted record defensively.
+
+    Field mapping:
+      - `question`  = `puzzle`, the NL clues (the EBM's conditioning input).
+      - `answer`    = serialized gold grid — the text the AE round-trips.
+      - `_solution` = raw {header, rows} dict, for the exact-match verifier.
+      - `_size`/`_id` = puzzle dimensions / id (size filtering, logging).
+    """
+
+    def __init__(
+        self,
+        split: str = "test",
+        max_samples: int | None = None,
+        min_size: int = 2,
+        max_size: int = 6,
+        seed: int = 0,
+    ):
+        ds = load_dataset("WildEval/ZebraLogic", "grid_mode", split=split)
+        ds = ds.shuffle(seed=seed)
+        self.examples: list[dict] = []
+        for ex in ds:
+            sol = ex.get("solution")
+            if not sol or "___" in str(sol):       # redacted mirror guard
+                continue
+            houses = len(sol.get("rows", []))
+            if houses < min_size or houses > max_size:
+                continue
+            self.examples.append({
+                "question": (ex.get("puzzle") or "").strip(),
+                "answer": serialize_zebra_solution(sol),
+                "_solution": sol,
+                "_size": ex.get("size"),
+                "_id": ex.get("id"),
+            })
+            if max_samples is not None and len(self.examples) >= max_samples:
+                break
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[int(idx)]
+
+
+# Value pools for synthetic grids — modelled on ZebraLogic's categories so the
+# surface form (tokens + structure) matches, while the *assignments* are random
+# and therefore share no puzzle with the eval set.
+_ZEBRA_SYNTH_POOLS = {
+    "Name": ["Peter", "Alice", "Bob", "Eric", "Arnold", "Carol", "Samuel", "Diana"],
+    "Nationality": ["norwegian", "german", "dane", "brit", "swede", "mexican", "chinese", "french"],
+    "BookGenre": ["mystery", "science fiction", "romance", "fantasy", "biography", "poetry", "history", "thriller"],
+    "Food": ["pizza", "grilled cheese", "spaghetti", "stew", "soup", "stir fry", "tacos", "sushi"],
+    "Color": ["red", "green", "blue", "yellow", "white", "purple", "brown", "orange"],
+    "Animal": ["dog", "cat", "bird", "fish", "horse", "rabbit", "zebra", "cow"],
+    "Drink": ["water", "tea", "coffee", "milk", "juice", "wine", "beer", "soda"],
+    "Hobby": ["painting", "cooking", "gardening", "photography", "cycling", "knitting", "fishing", "chess"],
+}
+
+
+class SyntheticZebraGridDataset(Dataset):
+    """Random ZebraLogic-style solution grids for AE format exposure.
+
+    Contamination-free by construction (random assignments over generic value
+    pools — never the eval puzzles), so it can be mixed into AE training without
+    touching the anchoring property. Only the **answer** serialization is
+    produced (there are no clues); its sole job is to teach the frozen-BART AE
+    the grid surface form, the anchoring-safe analog of mixing synthetic SQL.
+    """
+
+    def __init__(
+        self,
+        max_samples: int = 50_000,
+        min_size: int = 2,
+        max_size: int = 6,
+        min_attrs: int = 2,
+        max_attrs: int = 6,
+        seed: int = 0,
+    ):
+        rng = random.Random(seed)
+        cats = list(_ZEBRA_SYNTH_POOLS.keys())
+        max_attrs = min(max_attrs, len(cats))
+        self.examples: list[dict] = []
+        for _ in range(max_samples):
+            n = rng.randint(min_size, max_size)
+            a = rng.randint(min_attrs, max_attrs)
+            chosen = rng.sample(cats, a)
+            colvals = {c: rng.sample(_ZEBRA_SYNTH_POOLS[c], n) for c in chosen}
+            rows = [[str(i + 1)] + [colvals[c][i] for c in chosen] for i in range(n)]
+            sol = {"header": ["House"] + chosen, "rows": rows}
+            self.examples.append({
+                "question": "",
+                "answer": serialize_zebra_solution(sol),
+                "_solution": sol,
+            })
 
     def __len__(self):
         return len(self.examples)

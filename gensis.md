@@ -527,10 +527,12 @@ entries plus the NCE contrast. This is the LD4LG recipe, but it has a known
 weakness when decoded outputs have near-isomorphic forms whose correctness flips
 on a few tokens:
 
-- Two MBPP solutions differing only by `<` vs `<=` sit *very* close in MSE
-  distance while being maximally different in correctness.
+- Two ZebraLogic grids that swap a single attribute between two houses (or, in the
+  old SQL target, two queries differing only by `>` vs `>=`) sit *very* close in
+  MSE distance while being maximally different in correctness — one solves the
+  puzzle, the other fails the verifier outright.
 - MSE treats every latent dimension equally; it cannot "spend more budget" on the
-  operator-bearing tokens.
+  correctness-bearing cells/tokens.
 
 The decoder *does* know this distinction — its CE explicitly punishes the wrong
 token. So an optional low-`t` frozen-decoder CE auxiliary mixes in:
@@ -688,37 +690,80 @@ novelty is the combination and the calibration bet.
 
 A realistic single-GPU prototype to validate the core thesis.
 
-**Why code, not math or token-CoT.** GSM8K answers are 1–3 numeric tokens (~13
-bits) — too little structure for "reasoning *in* latent space" to be testable.
-ProofWriter/BBH give richer structure but the correctness-bearing part is a
-one-token verdict, and the proof chains are themselves token-CoT traces — which
-puts the prototype back in latent-encoded-token-CoT territory and defeats the
-decoder-transduces commitment. **Code generation cleans up both:** the target is a
-structured artifact (a Python function, 50–200 tokens of identifiers, operators,
-control flow), so the latent manifold has volume and the EBM has room to refine;
-the decoder genuinely transduces (Python's grammar is rigid, the decoder isn't
-problem-solving); and correctness is verifiable by an **external** signal
-(`assert` + subprocess), independent of `E` — the strongest possible test of the
-calibrated-scalar claim.
+**Why ZebraLogic, not Python, SQL, math, or token-CoT.** The target must satisfy
+two things at once: correctness verifiable by a signal independent of `E` (the
+§1.3 calibrated-scalar test), **and** an answer the frozen AE can actually
+round-trip — because the EBM can never reconstruct more faithfully than the AE,
+so the AE round-trip *is* the system's ceiling. Those pull in opposite
+directions, and the project found the boundary the hard way:
+
+- **Math / token-CoT** are verifiable but the answer is a 1–3 token verdict
+  (~13 bits) — too little structure for "reasoning *in* latent space" to be
+  testable, and the proof chains are themselves token-CoT, which puts the
+  prototype back in latent-encoded-token-CoT territory and defeats the
+  decoder-transduces commitment.
+- **Python** has rich structure and external verification but **failed at the
+  frozen-AE bottleneck**: a frozen BART/T5 AE cannot round-trip Python at all —
+  whitespace/newline collapse is fatal syntax loss (measured untrained floor
+  **0% exact / CER ~0.9** on MBPP+HumanEval; trained no-copy ~0%).
+- **SQL** looked like the fix — whitespace/case-robust, externally verifiable,
+  untrained bart-base floor a promising **44% normalized-exact** on Spider. But
+  trained out, it **confirmed the AE is the ceiling, not the task.** The trained
+  pool+recon reached only **~43% execution accuracy and flatlined after ~3k
+  steps**, while a *vanilla* bart-base round-trip with **no bottleneck** scored
+  **45%** on the same metric — the latent bottleneck added nothing and cost ~2
+  points. Reconstruction CER was excellent (**0.044**) yet execution stalled,
+  because SQL is zero-slack: one wrong identifier breaks the query, and the lossy
+  latent drops exactly those load-bearing tokens. The only levers that could help
+  — a copy mechanism or schema conditioning — both **hollow the latent** (the
+  decoder reconstructs from the source, not from `z`), leaving the EBM nothing to
+  condition on (`docs/autoencoder.md` §6.5). The AE itself was the binding
+  constraint.
+
+**ZebraLogic threads the needle.** It is a natural-language logic-grid (Zebra)
+puzzle: the constraints are English prose, so understanding them *is* a language
+task — the language AE is **load-bearing**, not a wrapper over a one-hot grid the
+way IRED's original CSP encoders were (which is exactly what makes a grid puzzle
+like Sudoku a non-answer here: a regular NN encodes it and the AE is redundant).
+Yet the **answer** is a structured assignment over a few houses and attributes,
+built from **OWT-frequent common nouns** (`Bob`, `german`, `dog`) in a fixed
+`House n: Attr=val, …` format — the low-entropy, whitespace-robust regime the
+frozen-anchor AE reconstructs well. It stays **exactly verifiable** (unique
+solution, programmatic checker), keeps **latent volume** (a 6×6 grid is tens of
+coupled cells, so the EBM has room to refine), and — being a CSP — is precisely
+where IRED-style iterative refinement is demonstrated to beat one-shot decoding.
+It is, in effect, *Sudoku stated in English*. Frontier LLMs solve only ~33% of
+ZebraLogic (12% on hard puzzles), so there is real reasoning headroom.
 
 **Setup:**
-- **Task:** MBPP (974 examples, full config) — NL description, canonical Python
-  solution, ≥3 assert tests. Primary EBM-training corpus. **HumanEval** (164) is
-  held-out eval only.
-- **AE pretraining corpus:** OpenWebText. The AE is deliberately **never** trained
-  on MBPP/HumanEval, to keep the latent space free of EBM-training-distribution
-  leakage and preserve the §2.2 anchoring property.
-- **LatentEnc/LatentDec:** `flan-t5-base` (d_model=768), frozen. Learned
-  `AttentionPool` (K=128–256) + `ReconstructionNet`.
+- **Task:** ZebraLogic (NL logic-grid puzzles). **Held-out eval:**
+  `WildEval/ZebraLogic` (grid_mode, 1000 puzzles, 2×2–6×6, unique solutions). The
+  `allenai/ZebraLogicBench` mirror ships solutions **redacted** (`___`) as a
+  leaderboard guard; `WildEval/ZebraLogic` keeps the gold grid. **Training format
+  source:** `SyntheticZebraGridDataset` — random grids over generic value pools in
+  the *identical* serialization. Being random assignments, they share no puzzle
+  with the eval set, so contamination is ruled out by construction (§2.2
+  anchoring), the analog of the synthetic-SQL / temporal-cutoff guarantees.
+- **AE pretraining corpus:** OpenWebText **50% + synthetic grids 50%**. Pure OWT
+  under-teaches the fixed `House n: …` surface; the synthetic slice supplies it
+  without ever showing the AE a real eval puzzle. The AE is **never** trained on
+  `WildEval/ZebraLogic`, so the latent space is not shaped by the eval
+  distribution.
+- **LatentEnc/LatentDec:** `facebook/bart-base` (d_model=768), encoder frozen,
+  conv `AttentionPool` (K=384) + `ReconstructionNet`, decoder fine-tuned jointly
+  (encoder stays frozen). bart-base over large (large hallucinates).
 - **Energy net:** 4-layer transformer over `(z_q, z_t, t)`; scalar via squared-sum
   head.
 - **Diffusion:** `T=10`, `cosine` schedule, `continuous=True`. Inner loop: 5 steps
   with bad-step rejection.
 - **Loss:** denoising MSE + NCE (`λ=1`). Optional low-`t` decoder-CE (§5.2) and
   generator-grounded negative (§5.3).
-- **Verifier:** decoded code executed in a subprocess with a 5s timeout. *Not
-  sandboxed* — fine for offline eval on MBPP/HumanEval, never point it at
-  adversarial input.
+- **Verifier:** `ZebraLogicVerifier` — parse the decoded grid into a
+  `{house: {attr: value}}` mapping and require **every** gold cell present and
+  equal (puzzle-level exact match; order-insensitive over attributes; unparseable
+  or partially-correct = fail). Pure structural comparison against the shipped
+  gold grid — no database lifecycle, unlike Spider; the solution is unique, so
+  all-or-nothing *is* the correctness metric.
 
 Practical defaults that survived first-run debugging (the *why* for each lives in
 `docs/implementation_pitfalls.md`): `cosine` schedule; `weight_decay=0.01`
@@ -728,23 +773,34 @@ Practical defaults that survived first-run debugging (the *why* for each lives i
 
 **Milestones:**
 
-1. **Autoencoder check** — `LatentDec(Recon(Pool(LatentEnc(code))))` round-trips on
-   the eval corpora *even though the AE saw only OpenWebText*. Bars: MBPP test
-   pass-rate ≥ 80%, HumanEval ≥ 80%, OWT byte-exact recon ≥ 50%.
-   These are aspirational — an 80% HumanEval pass-rate through a frozen
-   general-purpose T5 encoder/decoder trained only on OpenWebText is aggressive;
-   a more plausible initial bar is 30–50% on both code corpora, with the
-   critical signal being that round-tripping preserves enough structure for the
-   EBM to refine (i.e., the `inner=N − inner=0` gap in Milestone 2 is positive
-   despite imperfect reconstruction). If OWT clears but both code bars fail
-   badly, the OWT latent space doesn't transfer to Python — recover by adding a
-   code slice to AE pretraining or swapping to CodeT5.
-2. **Diffusion training** — train the EBM on MBPP. Watch `eps_scale` and the
+1. **Autoencoder check** — `LatentDec(Recon(Pool(LatentEnc(grid))))` round-trips on
+   held-out **ZebraLogic**, having trained the pool+recon (+decoder) on OWT +
+   synthetic grids but **never on the eval puzzles**. Metrics (defined in
+   `ired/data.py`):
+     - `zebra_exact` — puzzle-level exact match of the decoded grid vs the unique
+       gold (via `ZebraLogicVerifier`: every cell must match; order-insensitive
+       over attributes; unparseable/partial = fail). The headline.
+     - `zebra_recon_cer` — CharErrorRate of the round-tripped grid vs gold. Smooth
+       early signal, before exact-match moves.
+     - `owt_recon_cer` — generic-text reconstruction, unchanged.
+   Bars: `zebra_exact` ≥ 80% aspirational, 50–70% plausible; OWT byte-exact recon
+   ≥ 50%. Unlike SQL — where the trained AE flatlined at ~43% exec-acc and could
+   not beat a vanilla round-trip — the ZebraLogic answer surface sits in the AE's
+   friendly regime (common nouns, fixed format, whitespace/case-robust), so the
+   reconstruction ceiling should clear the SQL wall. The critical signal is that
+   round-tripping preserves enough structure for the EBM to refine (the
+   `inner=N − inner=0` gap in Milestone 2 is positive). If `zebra_exact` stalls,
+   raise the grid mix ratio or `K`, or restrict `--zebra-max-size` to start on
+   smaller puzzles before scaling up the size ladder.
+2. **Diffusion training** — train the EBM to map the puzzle clues (`z_q`) to the
+   solution-grid latent, eval on held-out ZebraLogic. Watch `eps_scale` and the
    `e_real/e_fake` ratio (either drifting is the head-inflation warning sign).
-   Report `pass(inner=N) − pass(inner=0)` on both corpora: positive deltas mean
-   iterative refinement is doing real work. Also report Pearson correlation
-   between `E(z_q, z, 0)` and observed pass/fail — the calibrated-scalar claim,
-   with code execution as the cleanest external signal.
+   Report `pass(inner=N) − pass(inner=0)`, where `pass` is `zebra_exact`: positive
+   deltas mean iterative refinement is doing real work — and a CSP is where that
+   refinement should pay off most (one-shot decoding can't backtrack over coupled
+   constraints). Also report Pearson correlation between `E(z_q, z, 0)` and
+   observed pass/fail — the calibrated-scalar claim, with the exact-match checker
+   as the clean external signal.
 3. **Test-time compute curve** — plot pass-rate vs. `N_inner × T` and compare to
    AR-CoT at matched FLOPs.
 
@@ -771,8 +827,16 @@ which is what justifies using `E` as the §4.3 gate.
 
 **Risks:**
 - Autoencoder quality bottleneck — most teams who tried latent-diffusion-for-text
-  reported the decoder as the limiting factor. It also caps world knowledge: the
-  EBM searches the space the AE defines, it does not store facts (§9 attacks this).
+  reported the decoder as the limiting factor, and it bit hard here twice. Python
+  round-trips at 0% (whitespace collapse), forcing the task to whitespace-robust
+  SQL; then SQL *also* hit the wall — the trained AE flatlined at ~43% execution
+  accuracy and could not beat a vanilla bottleneck-free round-trip, because a
+  lossy latent cannot carry zero-slack symbolic tokens and the copy/schema fixes
+  hollow the latent (§7). The resolution was to move the **task** into the AE's
+  reconstruction-friendly regime — a natural-language problem (so the AE is still
+  load-bearing) with a low-entropy, common-noun, verifiable answer (ZebraLogic),
+  rather than to keep fighting the AE. It also caps world knowledge: the EBM
+  searches the space the AE defines, it does not store facts (§9 attacks this).
 - RL-on-AR-CoT (R1, o1) is the current empirical winner. Any diffusion-based
   reasoner has to justify *not* using RL.
 - Reasoning may not be smooth in latent space. If correct reasoning traces are
@@ -781,10 +845,13 @@ which is what justifies using `E` as the §4.3 gate.
   memorized answer-latent." The `inner=N − inner=0` gap and a trajectory-decode
   diagnostic are the tests that distinguish the two.
 - The decoder-as-transducer assumption only holds for constrained output formats.
-  This prototype targets code; the approach is structurally restricted to domains
-  (code, formal logic, structured planning) where rendering doesn't itself require
-  reasoning. Open-ended natural language is out of scope — a real limitation, not
-  a temporary one.
+  This prototype targets ZebraLogic grids (chosen after Python and SQL both broke
+  the frozen AE — see §7); the approach is structurally restricted to domains
+  (structured planning, formal logic, logic-grid/CSP solutions, code) where
+  rendering the answer doesn't itself require reasoning. Open-ended natural
+  language is out of scope — a real limitation, not a temporary one. Note the
+  *input* may be open natural language (ZebraLogic's clues are prose); only the
+  *output* must be a constrained format the decoder can transduce.
 - Collapsing the composite cost (§2.3) to a single anchor is deliberate. If the
   single anchor proves gameable, additional anchors must be added and the
   bad-step contract re-checked under each.
@@ -882,10 +949,14 @@ learns nothing — the standard RAG contamination guard.
 - **Fair baseline.** When comparing against AR-CoT (§7, Milestone 3), feed the AR
   baseline the *same retrieved passages in-context* — otherwise it is a rigged
   comparison.
-- **Does it help *here*?** MBPP/HumanEval are more reasoning than knowledge-lookup,
-  so generic document retrieval may add little. The corpus likely to help is
-  **retrieved exemplars** (similar solved problems — retrieval-as-few-shot) or
-  library/API docs. Choose the corpus for signal, not convenience.
+- **Does it help *here*?** ZebraLogic is self-contained (every constraint needed
+  to solve a puzzle is in its clues), so retrieval is *not* load-bearing for the
+  prototype task — its value is the world-knowledge extension (§9 opener). Where
+  it would help most is **retrieved exemplars** (similar solved puzzles —
+  retrieval-as-few-shot) to seed the reasoning prior; generic document retrieval
+  adds little. On knowledge-heavy variants the relevant facts (the old text-to-SQL
+  analog being the database schema) become the high-signal corpus. Choose the
+  corpus for signal, not convenience.
 - **Attention cost.** Sequence length goes `1+2K → 1+2K+M`; with `K=256`, `+64` is
   negligible beside the double-backward MATH-kernel cost (`docs/implementation_pitfalls.md` §5).
 

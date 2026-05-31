@@ -3,25 +3,31 @@ the frozen BART decoder can round-trip text through K latent slots.
 
 The whole BART model stays frozen. Only the pool's + recon's parameters update.
 
-The AE trains on OpenWebText only — a broad natural-language corpus. The
-downstream EBM-training corpora (MBPP, HumanEval) are *never* used to shape
-the AE's latent space, so the EBM cannot exploit an AE-learned distribution
-bias (gensis §2.2 anchoring property).
+Two task substrates, via `--task`:
 
-Five metrics are reported each eval cycle:
-  - owt_recon_cer      character error rate (torchmetrics.text.CharErrorRate)
-                       of decoded OpenWebText vs gold. Lower is better; 0 = exact.
-  - mbpp_cer           same CER, on MBPP canonical solutions. Smooth proxy
-                       for "is reconstruction close" before pass-rate moves.
-  - mbpp_pass          fraction of MBPP test examples where the round-tripped
-                       canonical solution still passes its `test_list`.
-  - humaneval_cer      same CER, on HumanEval prompt+canonical.
-  - humaneval_pass     same pass-rate, for HumanEval (decode the full function
-                       and run its `check(entry_point)` fixture).
-CER gives a smooth signal — a few-char drift no longer reads as a total
-miss, which makes early training visible. Pass-rate stays the
-downstream-relevant metric: high-stakes diffs (operator swaps, name
-mangling) decode with low CER but still fail execution.
+- `sql` (default) — the current direction. The AE trains on **OpenWebText +
+  synthetic SQL** (`gretelai/synthetic_text_to_sql`, mixed at `--sql-mix-ratio`,
+  default 0.5) and is evaluated on held-out **Spider** reconstruction. Spider is
+  *never* used for training, so the latent space is not shaped by the eval
+  distribution (gensis §2.2 anchoring). The SQL slice is load-bearing: pure
+  OpenWebText cannot teach the AE SQL surface structure.
+- `code` — legacy Python path. Trains on OpenWebText (optionally mixed with
+  CodeSearchNet) and evals on MBPP/HumanEval execution pass-rate. Kept for
+  ablation; superseded because no frozen AE round-trips Python (0% floor).
+
+Metrics per eval cycle (selected by `--task`):
+  sql task:
+  - owt_recon_cer      CER (torchmetrics) of decoded OpenWebText vs gold.
+  - sql_recon_cer      same CER, on Spider gold SQL. Smooth early signal.
+  - sql_recon_match    fraction of Spider queries whose round-trip matches gold
+                       under `normalize_sql` (whitespace/case-insensitive) — the
+                       correctness-relevant comparison for SQL.
+  code task:
+  - owt_recon_cer, mbpp_cer, mbpp_pass, humaneval_cer, humaneval_pass
+                       (CER + execution pass-rate on MBPP/HumanEval).
+CER gives a smooth signal — a few-char drift no longer reads as a total miss.
+The match/pass metric stays the downstream-relevant one: high-stakes diffs
+(operator swaps, dropped predicates) decode with low CER but still fail.
 """
 from __future__ import annotations
 
@@ -53,11 +59,18 @@ from torchmetrics.text import CharErrorRate
 from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
     CodeSearchNetDataset,
+    GretelText2SQLDataset,
     HumanEvalDataset,
     MBPPDataset,
     MixedDataset,
     OpenWebTextDataset,
+    SpiderExecutionVerifier,
+    SpiderText2SQLDataset,
+    SyntheticZebraGridDataset,
+    ZebraLogicDataset,
+    ZebraLogicVerifier,
     collate,
+    sql_match_batch,
     verify_code_batch,
 )
 from ired.tui import make_reporter
@@ -122,6 +135,44 @@ def build_parser():
                         "tighter than prose docs.")
     p.add_argument("--code-max-chars", type=int, default=4_000,
                    help="hard char truncation for CodeSearchNet entries.")
+    p.add_argument("--task", choices=["zebra", "sql", "code"], default="zebra",
+                   help="'zebra' (default): train on OWT + synthetic logic-grid "
+                        "grids, eval on held-out ZebraLogic puzzles by exact-match. "
+                        "'sql': train on OWT + synthetic SQL, eval on held-out "
+                        "Spider reconstruction. 'code': legacy Python path "
+                        "(OWT[+CodeSearchNet], eval MBPP/HumanEval).")
+    p.add_argument("--zebra-mix-ratio", type=float, default=0.5,
+                   help="fraction of AE training examples drawn from synthetic "
+                        "ZebraLogic-style grids (SyntheticZebraGridDataset); the "
+                        "rest from OpenWebText. Only used when --task=zebra. The "
+                        "synthetic grids are random assignments — disjoint from the "
+                        "WildEval/ZebraLogic eval puzzles, so anchoring holds. "
+                        "0 = pure OWT.")
+    p.add_argument("--zebra-samples", type=int, default=50_000,
+                   help="number of synthetic grids to materialize (--task=zebra).")
+    p.add_argument("--zebra-min-size", type=int, default=2,
+                   help="smallest puzzle (houses) to keep in eval / generate.")
+    p.add_argument("--zebra-max-size", type=int, default=6,
+                   help="largest puzzle (houses) to keep in eval / generate.")
+    p.add_argument("--sql-mix-ratio", type=float, default=0.5,
+                   help="fraction of AE training examples drawn from the synthetic "
+                        "SQL source (gretelai/synthetic_text_to_sql); the rest from "
+                        "OpenWebText. Only used when --task=sql. 0 = pure OWT.")
+    p.add_argument("--sql-samples", type=int, default=50_000,
+                   help="number of synthetic-SQL examples to materialize for the "
+                        "training mix (--task=sql).")
+    p.add_argument("--sql-min-chars", type=int, default=20,
+                   help="drop synthetic-SQL queries shorter than this.")
+    p.add_argument("--sql-max-chars", type=int, default=1_000,
+                   help="skip (do NOT truncate — truncating yields invalid SQL) "
+                        "synthetic-SQL queries longer than this.")
+    p.add_argument("--sql-exec", action="store_true",
+                   help="score the Spider eval by EXECUTION accuracy (run pred vs "
+                        "gold against the real Spider DB, compare result sets) "
+                        "instead of normalized string match. Downloads the Spider "
+                        "databases (~105MB) once into ~/.cache/ired_spider.")
+    p.add_argument("--sql-exec-timeout", type=float, default=5.0,
+                   help="per-query wall-clock timeout for the SQL execution verifier.")
     p.add_argument("--mixed-length", type=int, default=200_000,
                    help="virtual length of the OWT+code mixed dataset (controls "
                         "DataLoader epoch length, not actual draw count).")
@@ -153,11 +204,6 @@ def build_parser():
                         "(OpenWebText doc, MBPP/HumanEval code).")
     p.add_argument("--eval-n-examples", type=int, default=64,
                    help="per-dataset examples to score each eval cycle.")
-    p.add_argument("--eval-beams", type=int, default=4,
-                   help="beam width for code-dataset (MBPP/HumanEval) eval decoding. "
-                        "OWT byte-match eval stays greedy (num_beams=1) because beam "
-                        "rarely helps exact-string match and costs ~num_beams× time. "
-                        "Set to 1 to keep all eval greedy.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--num-workers", type=int, default=2)
@@ -223,19 +269,25 @@ def build_param_groups(ae, weight_decay: float, decoder_lr: float | None = None)
 
 @torch.no_grad()
 def eval_reconstruction(ae, dataset, mode, device, max_a_length,
-                        n_examples=64, batch_size=16, num_beams=1):
+                        n_examples=64, batch_size=16, num_beams=1,
+                        verify_fn=None):
     """AE reconstruction eval.
 
     `mode` selects which scores are returned:
       - "byte"  : CER only. Returned as `cer` (lower=better). `pass_rate=None`.
-      - "code"  : both CER and execution pass-rate. CER is the smooth signal
-                  for early training; pass-rate is the downstream-relevant
-                  hard metric.
-    Always round-trips the "answer" field — for code datasets that's the
-    full executable function the EBM is supervised to denoise toward.
-    Token-level decode loss is reported alongside.
+      - "code"  : both CER and execution pass-rate (verify_code_batch). CER is
+                  the smooth signal; pass-rate is the downstream-relevant metric.
+      - "sql"   : both CER and normalized-match rate (sql_match_batch) — a
+                  whitespace/case-insensitive string match against gold SQL,
+                  returned in the `pass_rate` field.
+      - "zebra" : both CER and puzzle-level exact-match rate against the gold
+                  ZebraLogic grid, via `verify_fn`, in the `pass_rate` field.
+    For "sql"/"zebra" a `verify_fn(preds, batch) -> list[bool|None]` does the
+    scoring (None = unverifiable, excluded from the denominator).
+    Always round-trips the "answer" field — the artifact the EBM is supervised
+    to denoise toward. Token-level decode loss is reported alongside.
     """
-    assert mode in ("byte", "code")
+    assert mode in ("byte", "code", "sql", "zebra")
     ae.eval()
     losses: list[float] = []
     samples: list[tuple[str, str]] = []
@@ -257,6 +309,17 @@ def eval_reconstruction(ae, dataset, mode, device, max_a_length,
         # call forks `python`; threads wait on them concurrently.
         if mode == "code":
             results = verify_code_batch(preds, batch)
+        elif mode == "sql":
+            # Execution accuracy when a verifier is supplied (run pred vs gold on
+            # the real DB), else normalized whitespace/case-insensitive match.
+            if verify_fn is not None:
+                results = verify_fn(preds, batch)
+            else:
+                results = sql_match_batch(preds, gold)
+        elif mode == "zebra":
+            # Puzzle-level exact match against the gold grid (verify_fn reads
+            # each example's `_solution`).
+            results = verify_fn(preds, batch)
         else:
             results = [False] * len(preds)
         for pred, g, ok in zip(preds, gold, results):
@@ -264,14 +327,16 @@ def eval_reconstruction(ae, dataset, mode, device, max_a_length,
             # (leading/trailing whitespace from the tokenizer shouldn't count).
             all_preds.append(pred.strip())
             all_golds.append(g.strip())
-            if mode == "code":
-                code_total += 1
-                if ok:
-                    code_correct += 1
+            if mode in ("code", "sql", "zebra"):
+                if ok is not None:           # None = unverifiable (excluded)
+                    code_total += 1
+                    if ok:
+                        code_correct += 1
             if len(samples) < 3:
                 samples.append((g, pred))
     cer = CharErrorRate()(all_preds, all_golds).item()
-    pass_rate = code_correct / max(code_total, 1) if mode == "code" else None
+    pass_rate = (code_correct / max(code_total, 1)
+                 if mode in ("code", "sql", "zebra") else None)
     ae.train()
     return {
         "cer": cer,
@@ -399,13 +464,21 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
-    with make_reporter(
-        use_tui=args.tui,
-        eval_series=(
+    if args.task == "zebra":
+        eval_series = ("owt_recon_cer", "zebra_recon_cer", "zebra_exact")
+    elif args.task == "sql":
+        sql_metric_key = "sql_exec_acc" if args.sql_exec else "sql_recon_match"
+        eval_series = ("owt_recon_cer", "sql_recon_cer", sql_metric_key)
+    else:
+        eval_series = (
             "owt_recon_cer",
             "mbpp_cer", "mbpp_pass",
             "humaneval_cer", "humaneval_pass",
-        ),
+        )
+
+    with make_reporter(
+        use_tui=args.tui,
+        eval_series=eval_series,
         title="train_autoencoder",
     ) as r:
         d_ae = args.d_ae if args.d_ae > 0 else None
@@ -441,21 +514,66 @@ def main(argv=None):
         )
         r.log(f"  materialized {len(owt_train_ds)} OWT docs")
 
-        if args.code_mix_ratio > 0.0:
+        if args.task == "zebra" and args.zebra_mix_ratio > 0.0:
+            r.log(
+                f"  + synthetic ZebraLogic grids (materializing {args.zebra_samples}, "
+                f"sizes {args.zebra_min_size}–{args.zebra_max_size}, "
+                f"mix ratio={args.zebra_mix_ratio:.2f})"
+            )
+            domain_train_ds = SyntheticZebraGridDataset(
+                max_samples=args.zebra_samples,
+                min_size=args.zebra_min_size,
+                max_size=args.zebra_max_size,
+                seed=args.seed,
+            )
+            r.log(f"  materialized {len(domain_train_ds)} synthetic grids")
+            train_ds = MixedDataset(
+                datasets=[owt_train_ds, domain_train_ds],
+                weights=[1.0 - args.zebra_mix_ratio, args.zebra_mix_ratio],
+                length=args.mixed_length,
+            )
+            r.log(
+                f"  mixed train dataset: virtual length {len(train_ds)} "
+                f"({(1.0 - args.zebra_mix_ratio):.0%} OWT + {args.zebra_mix_ratio:.0%} grids)"
+            )
+        elif args.task == "sql" and args.sql_mix_ratio > 0.0:
+            r.log(
+                f"  + synthetic SQL (gretelai/synthetic_text_to_sql; materializing "
+                f"up to {args.sql_samples}, {args.sql_min_chars}≤len≤{args.sql_max_chars}, "
+                f"mix ratio={args.sql_mix_ratio:.2f})"
+            )
+            domain_train_ds = GretelText2SQLDataset(
+                split="train",
+                max_samples=args.sql_samples,
+                min_chars=args.sql_min_chars,
+                max_chars=args.sql_max_chars,
+                seed=args.seed,
+            )
+            r.log(f"  materialized {len(domain_train_ds)} SQL queries")
+            train_ds = MixedDataset(
+                datasets=[owt_train_ds, domain_train_ds],
+                weights=[1.0 - args.sql_mix_ratio, args.sql_mix_ratio],
+                length=args.mixed_length,
+            )
+            r.log(
+                f"  mixed train dataset: virtual length {len(train_ds)} "
+                f"({(1.0 - args.sql_mix_ratio):.0%} OWT + {args.sql_mix_ratio:.0%} SQL)"
+            )
+        elif args.task == "code" and args.code_mix_ratio > 0.0:
             r.log(
                 f"  + CodeSearchNet Python (materializing up to {args.code_samples} fns, "
                 f"{args.code_min_chars}≤len≤{args.code_max_chars}, "
                 f"mix ratio={args.code_mix_ratio:.2f})"
             )
-            code_train_ds = CodeSearchNetDataset(
+            domain_train_ds = CodeSearchNetDataset(
                 max_samples=args.code_samples,
                 min_chars=args.code_min_chars,
                 max_chars=args.code_max_chars,
                 seed=args.seed,
             )
-            r.log(f"  materialized {len(code_train_ds)} code fns")
+            r.log(f"  materialized {len(domain_train_ds)} code fns")
             train_ds = MixedDataset(
-                datasets=[owt_train_ds, code_train_ds],
+                datasets=[owt_train_ds, domain_train_ds],
                 weights=[1.0 - args.code_mix_ratio, args.code_mix_ratio],
                 length=args.mixed_length,
             )
@@ -465,7 +583,7 @@ def main(argv=None):
             )
         else:
             train_ds = owt_train_ds
-            r.log("  (--code-mix-ratio=0; training on pure OpenWebText)")
+            r.log("  (no domain mix; training on pure OpenWebText)")
 
         # Held-out OWT slice (different seed → effectively disjoint).
         r.log(f"  building OWT eval slice ({args.owt_eval_samples} docs, seed={args.seed + 1})")
@@ -476,14 +594,37 @@ def main(argv=None):
             seed=args.seed + 1,
         )
 
-        # MBPP test split — round-tripped on the answer field (full canonical
-        # solution) and scored via execution against `_test_script`.
-        r.log("  loading MBPP test split")
-        mbpp_eval_ds = MBPPDataset(split="test", max_samples=args.eval_n_examples, seed=args.seed)
-        r.log(f"    {len(mbpp_eval_ds)} examples")
-        r.log("  loading HumanEval (held-out)")
-        he_eval_ds = HumanEvalDataset(max_samples=args.eval_n_examples, seed=args.seed)
-        r.log(f"    {len(he_eval_ds)} examples")
+        # Held-out task eval. For sql: Spider validation (never trained on,
+        # disjoint from the synthetic SQL training source). For code: MBPP test
+        # + HumanEval, scored by execution.
+        sql_verifier = None
+        zebra_verifier = None
+        if args.task == "zebra":
+            r.log("  loading ZebraLogic (held-out NL logic-grid eval)")
+            zebra_eval_ds = ZebraLogicDataset(
+                split="test", max_samples=args.eval_n_examples,
+                min_size=args.zebra_min_size, max_size=args.zebra_max_size,
+                seed=args.seed,
+            )
+            r.log(f"    {len(zebra_eval_ds)} puzzles")
+            zebra_verifier = ZebraLogicVerifier()
+        elif args.task == "sql":
+            r.log("  loading Spider validation (held-out SQL eval)")
+            sql_eval_ds = SpiderText2SQLDataset(
+                split="validation", max_samples=args.eval_n_examples, seed=args.seed,
+            )
+            r.log(f"    {len(sql_eval_ds)} examples")
+            if args.sql_exec:
+                r.log("  building Spider execution verifier (downloads DBs if needed)")
+                sql_verifier = SpiderExecutionVerifier(timeout=args.sql_exec_timeout)
+                r.log(f"    db_root={sql_verifier.db_root}")
+        else:
+            r.log("  loading MBPP test split")
+            mbpp_eval_ds = MBPPDataset(split="test", max_samples=args.eval_n_examples, seed=args.seed)
+            r.log(f"    {len(mbpp_eval_ds)} examples")
+            r.log("  loading HumanEval (held-out)")
+            he_eval_ds = HumanEvalDataset(max_samples=args.eval_n_examples, seed=args.seed)
+            r.log(f"    {len(he_eval_ds)} examples")
 
         # Note: we don't pre-tokenize the AE training corpus. OpenWebText /
         # MixedDataset is large (tens of thousands of docs) and only sees
@@ -585,54 +726,118 @@ def main(argv=None):
                     n_examples=args.eval_n_examples, batch_size=args.batch_size,
                     num_beams=1,
                 )
-                ev_mbpp = eval_reconstruction(
-                    ae, mbpp_eval_ds, "code", args.device, args.max_a_length,
-                    n_examples=args.eval_n_examples, batch_size=args.batch_size,
-                    num_beams=args.eval_beams,
-                )
-                ev_he = eval_reconstruction(
-                    ae, he_eval_ds, "code", args.device, args.max_a_length,
-                    n_examples=args.eval_n_examples, batch_size=args.batch_size,
-                    num_beams=args.eval_beams,
-                )
-                r.eval_point(
-                    step,
-                    owt_recon_cer=ev_owt["cer"],
-                    mbpp_cer=ev_mbpp["cer"],
-                    mbpp_pass=ev_mbpp["pass_rate"],
-                    humaneval_cer=ev_he["cer"],
-                    humaneval_pass=ev_he["pass_rate"],
-                )
-                r.log(
-                    f"  [eval] owt_recon_cer={ev_owt['cer']:.3f} (n={ev_owt['n']})  "
-                    f"mbpp_cer={ev_mbpp['cer']:.3f} mbpp_pass={ev_mbpp['pass_rate']:.3f} (n={ev_mbpp['n']})  "
-                    f"humaneval_cer={ev_he['cer']:.3f} humaneval_pass={ev_he['pass_rate']:.3f} (n={ev_he['n']})"
-                )
-                r.log(
-                    f"    losses: owt={ev_owt['loss']:.3f}  "
-                    f"mbpp={ev_mbpp['loss']:.3f}  humaneval={ev_he['loss']:.3f}"
-                )
+                if args.task == "zebra":
+                    ev_zebra = eval_reconstruction(
+                        ae, zebra_eval_ds, "zebra", args.device, args.max_a_length,
+                        n_examples=args.eval_n_examples, batch_size=args.batch_size,
+                        num_beams=1, verify_fn=zebra_verifier.verify_batch,
+                    )
+                    r.eval_point(step, **{
+                        "owt_recon_cer": ev_owt["cer"],
+                        "zebra_recon_cer": ev_zebra["cer"],
+                        "zebra_exact": ev_zebra["pass_rate"],
+                    })
+                    r.log(
+                        f"  [eval] owt_recon_cer={ev_owt['cer']:.3f} (n={ev_owt['n']})  "
+                        f"zebra_recon_cer={ev_zebra['cer']:.3f} "
+                        f"zebra_exact={ev_zebra['pass_rate']:.3f} (n={ev_zebra['n']})"
+                    )
+                    r.log(f"    losses: owt={ev_owt['loss']:.3f}  zebra={ev_zebra['loss']:.3f}")
+                    eval_named = [("owt", ev_owt), ("zebra", ev_zebra)]
+                    ckpt_metrics = {
+                        "owt_recon_cer": ev_owt["cer"],
+                        "zebra_recon_cer": ev_zebra["cer"],
+                        "zebra_exact": ev_zebra["pass_rate"],
+                    }
+                elif args.task == "sql":
+                    # POPULATE the Spider DBs for this eval cycle (execution mode),
+                    # run the eval, then DEPOPULATE to free the in-memory DBs.
+                    if sql_verifier is not None:
+                        n = min(args.eval_n_examples, len(sql_eval_ds))
+                        sql_verifier.setup([sql_eval_ds[i]["_db_id"] for i in range(n)])
+                        if sql_verifier.missing:
+                            r.log(f"    [sql-exec] missing DBs (excluded): "
+                                  f"{sorted(sql_verifier.missing)}")
+                    ev_sql = eval_reconstruction(
+                        ae, sql_eval_ds, "sql", args.device, args.max_a_length,
+                        n_examples=args.eval_n_examples, batch_size=args.batch_size,
+                        num_beams=1,
+                        verify_fn=(sql_verifier.verify_batch if sql_verifier else None),
+                    )
+                    if sql_verifier is not None:
+                        sql_verifier.teardown()
+                    r.eval_point(step, **{
+                        "owt_recon_cer": ev_owt["cer"],
+                        "sql_recon_cer": ev_sql["cer"],
+                        sql_metric_key: ev_sql["pass_rate"],
+                    })
+                    r.log(
+                        f"  [eval] owt_recon_cer={ev_owt['cer']:.3f} (n={ev_owt['n']})  "
+                        f"sql_recon_cer={ev_sql['cer']:.3f} "
+                        f"{sql_metric_key}={ev_sql['pass_rate']:.3f} (n={ev_sql['n']})"
+                    )
+                    r.log(f"    losses: owt={ev_owt['loss']:.3f}  sql={ev_sql['loss']:.3f}")
+                    eval_named = [("owt", ev_owt), ("sql", ev_sql)]
+                    ckpt_metrics = {
+                        "owt_recon_cer": ev_owt["cer"],
+                        "sql_recon_cer": ev_sql["cer"],
+                        sql_metric_key: ev_sql["pass_rate"],
+                    }
+                else:
+                    ev_mbpp = eval_reconstruction(
+                        ae, mbpp_eval_ds, "code", args.device, args.max_a_length,
+                        n_examples=args.eval_n_examples, batch_size=args.batch_size,
+                        num_beams=1,
+                    )
+                    ev_he = eval_reconstruction(
+                        ae, he_eval_ds, "code", args.device, args.max_a_length,
+                        n_examples=args.eval_n_examples, batch_size=args.batch_size,
+                        num_beams=1,
+                    )
+                    r.eval_point(
+                        step,
+                        owt_recon_cer=ev_owt["cer"],
+                        mbpp_cer=ev_mbpp["cer"],
+                        mbpp_pass=ev_mbpp["pass_rate"],
+                        humaneval_cer=ev_he["cer"],
+                        humaneval_pass=ev_he["pass_rate"],
+                    )
+                    r.log(
+                        f"  [eval] owt_recon_cer={ev_owt['cer']:.3f} (n={ev_owt['n']})  "
+                        f"mbpp_cer={ev_mbpp['cer']:.3f} mbpp_pass={ev_mbpp['pass_rate']:.3f} (n={ev_mbpp['n']})  "
+                        f"humaneval_cer={ev_he['cer']:.3f} humaneval_pass={ev_he['pass_rate']:.3f} (n={ev_he['n']})"
+                    )
+                    r.log(
+                        f"    losses: owt={ev_owt['loss']:.3f}  "
+                        f"mbpp={ev_mbpp['loss']:.3f}  humaneval={ev_he['loss']:.3f}"
+                    )
+                    eval_named = [("owt", ev_owt), ("mbpp", ev_mbpp), ("humaneval", ev_he)]
+                    ckpt_metrics = {
+                        "owt_recon_cer": ev_owt["cer"],
+                        "mbpp_cer": ev_mbpp["cer"],
+                        "mbpp_pass": ev_mbpp["pass_rate"],
+                        "humaneval_cer": ev_he["cer"],
+                        "humaneval_pass": ev_he["pass_rate"],
+                    }
 
                 def _snip(s, n=180):
                     # Collapse each newline + its surrounding indentation into a
                     # single ⏎ marker, then squeeze any remaining runs of spaces.
-                    # Code samples (esp. MBPP/HumanEval) are otherwise dominated by
-                    # indentation whitespace — many spaces where one ⏎ reads cleaner.
+                    # Code/SQL samples are otherwise dominated by indentation
+                    # whitespace — many spaces where one ⏎ reads cleaner.
                     s = re.sub(r"[ \t]*\n[ \t]*", " ⏎ ", s)
                     s = re.sub(r"[ \t]{2,}", " ", s)
                     return s if len(s) <= n else s[:n] + "…"
 
-                for name, ev in [("owt", ev_owt), ("mbpp", ev_mbpp), ("humaneval", ev_he)]:
+                for name, ev in eval_named:
                     if not ev["samples"]:
                         continue
                     gold, pred = ev["samples"][0]
                     r.log(f"    [{name}] gold: {_snip(gold)}")
                     r.log(f"    [{name}] pred: {_snip(pred)}")
-                    # Raw repr exposes silent whitespace/newline loss (e.g. T5
-                    # tokenizer dropping '\n' makes code untestable even when the
-                    # tokens are right). Only dump for code datasets — OWT is too
-                    # noisy in raw form to be useful.
-                    if name in ("mbpp", "humaneval"):
+                    # Raw repr exposes silent whitespace/newline loss. Only dump
+                    # for the structured task datasets — OWT is too noisy raw.
+                    if name in ("mbpp", "humaneval", "sql", "zebra"):
                         r.log(f"    [{name}] gold(raw): {gold[:240]!r}")
                         r.log(f"    [{name}] pred(raw): {pred[:240]!r}")
 
@@ -642,11 +847,7 @@ def main(argv=None):
                     "scheduler": sched.state_dict(),
                     "config": vars(args),
                     "step": step,
-                    "owt_recon_cer": ev_owt["cer"],
-                    "mbpp_cer": ev_mbpp["cer"],
-                    "mbpp_pass": ev_mbpp["pass_rate"],
-                    "humaneval_cer": ev_he["cer"],
-                    "humaneval_pass": ev_he["pass_rate"],
+                    **ckpt_metrics,
                 }
                 torch.save(ckpt, os.path.join(args.save_dir, f"ae_step{step}.pt"))
                 torch.save(ckpt, os.path.join(args.save_dir, "ae_latest.pt"))

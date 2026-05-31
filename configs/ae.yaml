@@ -1,4 +1,7 @@
-# Autoencoder training config — conv pool + unfrozen decoder
+# Autoencoder training config — conv pool + unfrozen decoder, text-to-SQL task
+#
+# Trains the AttentionPool + ReconstructionNet on OpenWebText + synthetic SQL
+# and evaluates round-trip reconstruction on held-out Spider (execution accuracy).
 #
 # Launch:  uv run python -m ired.train_autoencoder --config configs/ae_conv_pg.yaml
 # CLI args override config values, so e.g. `--seed 42` on the command line
@@ -19,8 +22,11 @@ recon_layers: 2
 recon_heads: 8
 
 # ── Decode-side knobs ──────────────────────────────────────────────────
-unfreeze_decoder: true       # fine-tune BART decoder jointly (matches the ae_conv_norm_copy2 reference)
+unfreeze_decoder: true       # fine-tune BART decoder jointly (encoder stays frozen)
 decoder_lr: 1.0e-5           # separate (smaller) LR for decoder params
+
+# ── Task ───────────────────────────────────────────────────────────────
+task: sql                    # sql (OWT + synthetic SQL, eval Spider) | code (legacy MBPP/HumanEval)
 
 # ── Training data ──────────────────────────────────────────────────────
 train_dataset: openwebtext
@@ -29,12 +35,12 @@ owt_min_chars: 200
 owt_max_chars: 4000
 owt_eval_samples: 256
 
-code_mix_ratio: 0.3          # fraction CodeSearchNet Python (0 = pure OWT)
-code_samples: 60000          # CodeSearchNet fns to materialize
-code_min_chars: 100
-code_max_chars: 4000
+sql_mix_ratio: 0.5           # fraction synthetic SQL (gretelai/synthetic_text_to_sql); rest OWT
+sql_samples: 50000           # synthetic-SQL queries to materialize
+sql_min_chars: 20
+sql_max_chars: 1000          # skip (not truncate) longer queries — truncating yields invalid SQL
 
-mixed_length: 200000         # virtual length of mixed OWT+code dataset
+mixed_length: 200000         # virtual length of mixed OWT+SQL dataset
 
 # ── Optimization ───────────────────────────────────────────────────────
 batch_size: 64
@@ -49,16 +55,17 @@ log_every: 50                # steps between log lines
 eval_every: 1000             # steps between eval cycles
 
 # ── Eval ───────────────────────────────────────────────────────────────
-max_a_length: 512            # tokenizer truncation cap (was 256; 41.5% of HumanEval truncated at 256)
-eval_n_examples: 64          # per-dataset examples each eval
-eval_beams: 4                # beam width for code eval (OWT stays greedy)
+max_a_length: 512            # tokenizer truncation cap for the round-tripped answer
+eval_n_examples: 64          # held-out Spider examples each eval cycle
+sql_exec: true               # execution accuracy vs the real Spider DBs (result-set match); else string match
+sql_exec_timeout: 5.0        # per-query wall-clock timeout for the SQL execution verifier
 
 # ── Infrastructure ─────────────────────────────────────────────────────
 num_workers: 4
 seed: 0
 device: cuda                 # cuda | cpu
 tui: true                    # Rich+plotext TUI (graphs + scrolling log)
-save_dir: checkpoints/ae_conv_pg2
+save_dir: checkpoints/ae_sql_conv
 
 # ── HuggingFace Hub (optional) ─────────────────────────────────────────
 push_to_hub: true
