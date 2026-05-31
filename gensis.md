@@ -740,13 +740,10 @@ ZebraLogic (12% on hard puzzles), so there is real reasoning headroom.
   `WildEval/ZebraLogic` (grid_mode, 1000 puzzles, 2×2–6×6, unique solutions). The
   `allenai/ZebraLogicBench` mirror ships solutions **redacted** (`___`) as a
   leaderboard guard; `WildEval/ZebraLogic` keeps the gold grid. **Training format
-  source:** `SyntheticZebraGridDataset` — random grids over generic value pools in
-  the *identical* serialization. Being random assignments, they share no puzzle
-  with the eval set, so contamination is ruled out by construction (§2.2
-  anchoring), the analog of the synthetic-SQL / temporal-cutoff guarantees.
-- **AE pretraining corpus:** OpenWebText **50% + synthetic grids 50%**. Pure OWT
-  under-teaches the fixed `House n: …` surface; the synthetic slice supplies it
-  without ever showing the AE a real eval puzzle. The AE is **never** trained on
+  source:** The AE trains on pure OpenWebText — the grid surface form (fixed
+  `House n: …` structure with common-noun values) is close enough to OWT's
+  natural distribution that no synthetic format exposure is needed.
+- **AE pretraining corpus:** OpenWebText. The AE is **never** trained on
   `WildEval/ZebraLogic`, so the latent space is not shaped by the eval
   distribution.
 - **LatentEnc/LatentDec:** `facebook/bart-base` (d_model=768), encoder frozen,

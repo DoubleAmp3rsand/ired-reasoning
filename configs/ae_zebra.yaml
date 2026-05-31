@@ -1,17 +1,15 @@
 # Autoencoder training config — conv pool + unfrozen decoder, ZebraLogic task
 #
-# Trains the AttentionPool + ReconstructionNet on OpenWebText + synthetic
-# logic-grid solutions, and evaluates round-trip reconstruction on held-out
-# ZebraLogic puzzles by puzzle-level exact match.
+# Trains the AttentionPool + ReconstructionNet on OpenWebText and evaluates
+# round-trip reconstruction on held-out ZebraLogic puzzles by puzzle-level
+# exact match.
 #
 # Why ZebraLogic: the AE round-trip is the binding ceiling for any
-# execution-graded structured target (the SQL run showed the trained AE could
-# not beat a vanilla bart-base round-trip on execution accuracy — the lossy
-# latent drops the load-bearing tokens, and copy/schema tricks would hollow the
-# latent the EBM conditions on). ZebraLogic keeps an irreducibly natural-language
-# problem (so the language AE is load-bearing) AND an exactly verifiable answer,
-# while the answer surface is low-entropy / common-noun / fixed-format — the
-# regime the frozen-anchor AE reconstructs well. "Sudoku stated in English."
+# execution-graded structured target. ZebraLogic keeps an irreducibly
+# natural-language problem (so the language AE is load-bearing) AND an exactly
+# verifiable answer, while the answer surface is low-entropy / common-noun /
+# fixed-format — the regime the frozen-anchor AE reconstructs well.
+# "Sudoku stated in English."
 #
 # Launch:  uv run python -m ired.train_autoencoder --config configs/ae_zebra.yaml
 # CLI args override config values (e.g. `--seed 42` wins over `seed: 0`).
@@ -34,22 +32,12 @@ recon_heads: 8
 unfreeze_decoder: true       # fine-tune BART decoder jointly (encoder stays frozen)
 decoder_lr: 1.0e-5           # separate (smaller) LR for decoder params
 
-# ── Task ───────────────────────────────────────────────────────────────
-task: zebra                  # zebra (OWT + synthetic grids, eval ZebraLogic) | sql | code
-
 # ── Training data ──────────────────────────────────────────────────────
 train_dataset: openwebtext
 owt_samples: 100000          # OWT docs to materialize
 owt_min_chars: 200
 owt_max_chars: 4000
 owt_eval_samples: 256
-
-zebra_mix_ratio: 0.5         # fraction synthetic logic-grid solutions; rest OWT
-zebra_samples: 50000         # synthetic grids to materialize (random, eval-disjoint)
-zebra_min_size: 2            # smallest puzzle (houses) to keep / generate
-zebra_max_size: 6            # largest puzzle (houses) to keep / generate
-
-mixed_length: 200000         # virtual length of mixed OWT+grids dataset
 
 # ── Optimization ───────────────────────────────────────────────────────
 batch_size: 64
@@ -66,6 +54,8 @@ eval_every: 1000             # steps between eval cycles
 # ── Eval ───────────────────────────────────────────────────────────────
 max_a_length: 512            # tokenizer truncation cap for the round-tripped grid
 eval_n_examples: 64          # held-out ZebraLogic puzzles each eval cycle
+zebra_min_size: 2            # smallest puzzle (houses) to keep in eval
+zebra_max_size: 6            # largest puzzle (houses) to keep in eval
 
 # ── Infrastructure ─────────────────────────────────────────────────────
 num_workers: 4

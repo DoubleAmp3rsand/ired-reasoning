@@ -1,11 +1,11 @@
 """Milestone 3 (gensis.md §7): test-time compute curve.
 
-Sweeps `inner_steps` ∈ {0, 1, 2, 5, 10} and reports pass-rate on the chosen
-eval corpus (MBPP or HumanEval). The "decision rule" in gensis: a steeper
-pass-rate-vs-compute curve than AR-CoT at matched FLOPs validates the thesis;
-a plateau below is an informative negative about smoothness of reasoning in
-latent space.
+Sweeps `inner_steps` ∈ {0, 1, 2, 5, 10} and reports exact-match rate on
+ZebraLogic puzzles. The "decision rule" in gensis: a steeper pass-rate-vs-compute
+curve than AR-CoT at matched FLOPs validates the thesis; a plateau below is an
+informative negative about smoothness of reasoning in latent space.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -15,9 +15,8 @@ import torch
 
 from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
-    HumanEvalDataset,
-    MBPPDataset,
-    verify_code,
+    ZebraLogicDataset,
+    zebra_match,
 )
 from ired.model.diffusion import GaussianLatentDiffusion
 from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
@@ -44,21 +43,20 @@ def build_parser():
     p.add_argument("--inner-steps", type=int, nargs="+", default=[0, 1, 2, 5, 10])
     p.add_argument("--x-start-clamp", type=float, default=5.0)
     p.add_argument("--envelope-sf", type=float, default=-1.0)
-    p.add_argument("--eval-dataset", choices=["mbpp", "humaneval"], default="mbpp",
-                   help="Test corpus to sweep over.")
-    p.add_argument("--mbpp-config", choices=["full", "sanitized"], default="full")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--n-examples", type=int, default=320,
                    help="total test examples to score per inner_steps setting.")
     p.add_argument("--max-q-length", type=int, default=512)
     p.add_argument("--max-a-length", type=int, default=384)
+    p.add_argument("--zebra-min-size", type=int, default=2)
+    p.add_argument("--zebra-max-size", type=int, default=6)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p
 
 
 @torch.no_grad()
-def sample_accuracy(ae, diffusion, dataset, dataset_name, device,
+def sample_accuracy(ae, diffusion, dataset, device,
                     max_q_length, max_a_length, inner_steps, n_examples, batch_size):
     correct = 0
     total = 0
@@ -73,7 +71,7 @@ def sample_accuracy(ae, diffusion, dataset, dataset_name, device,
         preds = ae.decode(z, max_length=max_a_length)
         for ex, pred in zip(batch, preds):
             total += 1
-            if verify_code(pred, ex):
+            if zebra_match(pred, ex["_solution"]):
                 correct += 1
     return correct / max(total, 1), total
 
@@ -122,9 +120,6 @@ def main(argv=None):
     ).to(args.device)
     diffusion.eval()
 
-    # Restore the per-dim latent normalization (LD4LG shift+scale). Missing
-    # stats = old checkpoint trained before normalization existed; fall back
-    # to identity and warn — sampling will be miscalibrated.
     if "latent_mu" in ebm_ckpt and "latent_sigma" in ebm_ckpt:
         diffusion.set_latent_stats(
             ebm_ckpt["latent_mu"].to(args.device),
@@ -140,20 +135,18 @@ def main(argv=None):
             "identity normalization, which is likely miscalibrated."
         )
 
-    if args.eval_dataset == "mbpp":
-        test_ds = MBPPDataset(
-            split="test", config=args.mbpp_config,
-            max_samples=args.n_examples, seed=args.seed,
-        )
-    else:
-        test_ds = HumanEvalDataset(max_samples=args.n_examples, seed=args.seed)
-    print(f"eval dataset: {args.eval_dataset} ({len(test_ds)} examples)")
+    test_ds = ZebraLogicDataset(
+        split="test", max_samples=args.n_examples,
+        min_size=args.zebra_min_size, max_size=args.zebra_max_size,
+        seed=args.seed,
+    )
+    print(f"eval dataset: ZebraLogic ({len(test_ds)} examples)")
 
     print(f"{'inner':>6}  {'acc':>6}  {'n':>5}  {'ebm_passes':>11}  {'time_s':>7}")
     for n_inner in args.inner_steps:
         t0 = time.time()
         acc, total = sample_accuracy(
-            ae, diffusion, test_ds, args.eval_dataset, args.device,
+            ae, diffusion, test_ds, args.device,
             args.max_q_length, args.max_a_length, n_inner,
             args.n_examples, args.batch_size,
         )

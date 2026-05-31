@@ -8,10 +8,10 @@ Two reporters with the same interface:
 
 Usage:
 
-    with make_reporter(use_tui=args.tui, eval_series=("mbpp_pass", "humaneval_pass")) as r:
+    with make_reporter(use_tui=args.tui, eval_series=("zebra_exact", "owt_recon_cer")) as r:
         r.log("loading ...")
         r.train_point(step, loss=loss_val, lr=cur_lr)
-        r.eval_point(step, mbpp_pass=0.31, humaneval_pass=0.22)
+        r.eval_point(step, zebra_exact=0.45, owt_recon_cer=0.12)
 
 Train points feed the loss / lr graph. Eval points feed one line per series
 on the eval graph (series names declared up-front so colors stay stable).

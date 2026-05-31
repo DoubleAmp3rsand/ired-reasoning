@@ -14,6 +14,7 @@ Outputs a per-sample breakdown:
 `actor_frac` is the fraction of test queries that took the cheap Mode-1 path
 at the given threshold — the inference-economics knob from §1.4 / §5.4.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,9 +25,8 @@ import torch
 from ired.actor import Actor
 from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
-    HumanEvalDataset,
-    MBPPDataset,
-    verify_code,
+    ZebraLogicDataset,
+    zebra_match,
 )
 from ired.model.diffusion import GaussianLatentDiffusion
 from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
@@ -55,20 +55,20 @@ def build_parser():
     p.add_argument("--inner-steps", type=int, default=5)
     p.add_argument("--x-start-clamp", type=float, default=5.0)
     p.add_argument("--envelope-sf", type=float, default=-1.0)
-    p.add_argument("--eval-dataset", choices=["mbpp", "humaneval"], default="mbpp")
-    p.add_argument("--mbpp-config", choices=["full", "sanitized"], default="full")
     p.add_argument("--threshold", type=float, default=None,
                    help="Energy threshold. If unset, calibrate to keep --actor-target "
                         "of queries on the Mode-1 path.")
     p.add_argument("--actor-target", type=float, default=0.8,
                    help="Fraction of queries to route through the actor when "
-                        "calibrating threshold automatically (default 80%%, §5.4).")
+                        "calibrating threshold automatically (default 80%, §5.4).")
     p.add_argument("--calib-examples", type=int, default=80,
                    help="Number of test examples used to calibrate the threshold.")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--n-examples", type=int, default=320)
     p.add_argument("--max-q-length", type=int, default=512)
     p.add_argument("--max-a-length", type=int, default=384)
+    p.add_argument("--zebra-min-size", type=int, default=2)
+    p.add_argument("--zebra-max-size", type=int, default=6)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p
@@ -82,7 +82,7 @@ def _iter_batches(dataset, n_examples, batch_size):
 
 
 def _score(example, pred) -> bool:
-    return verify_code(pred, example)
+    return zebra_match(pred, example["_solution"])
 
 
 @torch.no_grad()
@@ -108,7 +108,7 @@ def calibrate_threshold(
 
 @torch.no_grad()
 def adaptive_sample(
-    ae, actor, ebm, diffusion, dataset, dataset_name, device,
+    ae, actor, ebm, diffusion, dataset, device,
     max_q_length, max_a_length, inner_steps, threshold, n_examples, batch_size,
 ):
     a_correct = total = 0
@@ -207,14 +207,12 @@ def main(argv=None):
             ebm_ckpt["latent_sigma"].to(args.device),
         )
 
-    if args.eval_dataset == "mbpp":
-        test_ds = MBPPDataset(
-            split="test", config=args.mbpp_config,
-            max_samples=args.n_examples, seed=args.seed,
-        )
-    else:
-        test_ds = HumanEvalDataset(max_samples=args.n_examples, seed=args.seed)
-    print(f"eval dataset: {args.eval_dataset} ({len(test_ds)} examples)")
+    test_ds = ZebraLogicDataset(
+        split="test", max_samples=args.n_examples,
+        min_size=args.zebra_min_size, max_size=args.zebra_max_size,
+        seed=args.seed,
+    )
+    print(f"eval dataset: ZebraLogic ({len(test_ds)} examples)")
 
     if args.threshold is None:
         threshold = calibrate_threshold(
@@ -228,7 +226,7 @@ def main(argv=None):
 
     t0 = time.time()
     out = adaptive_sample(
-        ae, actor, ebm, diffusion, test_ds, args.eval_dataset, args.device,
+        ae, actor, ebm, diffusion, test_ds, args.device,
         args.max_q_length, args.max_a_length, args.inner_steps,
         threshold, args.n_examples, args.batch_size,
     )

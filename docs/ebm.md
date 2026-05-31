@@ -237,26 +237,25 @@ run at EBM inference.
 
 ### 4.4 Dataset
 
-Trains on **MBPP** (`--mbpp-config full` = 974 ex / `sanitized` = 427). Evaluates
-on **MBPP test + HumanEval** (held out). HumanEval is never trained on. The AE
-was never trained on either (`gensis.md` §3.2 anchoring), so the gold-answer
-latent is a fixed target the EBM cannot exploit via AE distribution bias.
+Trains on **ZebraLogic** train split. Evaluates on **ZebraLogic test** (held out).
+ZebraLogic test is never trained on. The AE was never trained on it either
+(`gensis.md` §3.2 anchoring), so the gold-answer latent is a fixed target the
+EBM cannot exploit via AE distribution bias.
 
 ### 4.5 Metrics (per eval cycle, `eval_corpus`)
 
-End-to-end: sample `z` from `z_q`, decode, execute the decoded code against each
-example's tests.
+End-to-end: sample `z` from `z_q`, decode, compare the decoded grid against the
+gold solution by puzzle-level exact match.
 
 | Metric | Meaning |
 |--------|---------|
-| `acc` | pass-rate with full `inner_steps` of refinement |
-| `acc_inner0` | pass-rate with `inner_steps=0` — isolates the gain from `opt_step` |
-| `ae_acc` | pass-rate of `decode(encode(answer))` — the Milestone-1 AE ceiling |
+| `acc` | exact-match rate with full `inner_steps` of refinement |
+| `acc_inner0` | exact-match rate with `inner_steps=0` — isolates the gain from `opt_step` |
+| `ae_acc` | exact-match rate of `decode(encode(answer))` — the Milestone-1 AE ceiling |
 | `mse_z`, `corr_z` | L2 / cosine of sampled latent vs `z_a` |
 | `std_za`, `std_zs` | element-std of gold vs sampled latents (scale drift) |
-| `ce_pass` / `ce_fail` / `eb_gap` | teacher-forced CE on the sampled latent, split by free-running pass/fail. A large `eb_gap` (`ce_fail − ce_pass`) means latent quality tracks correctness; a small gap with both CEs low means the latent points the decoder at gold but free-running decode still flakes (AR leakage). |
 
-`ae_acc < 0.5` on either corpus means the **AE is the bottleneck**, not the EBM.
+`ae_acc < 0.5` means the **AE is the bottleneck**, not the EBM.
 
 ---
 
@@ -434,9 +433,9 @@ Saved each eval cycle to `ebm_step{N}.pt` and `ebm_latest.pt`:
     "latent_sigma": tensor,       # (d_ae,) normalization scale
     "config":       vars(args),   # full training config
     "step":         int,
-    "mbpp_pass":    float, "humaneval_pass": float,
-    "mbpp_ae_pass": float, "humaneval_ae_pass": float,
-    "mse_z_mbpp":   float, "mbpp_eb_gap": float, "humaneval_eb_gap": float,
+    "zebra_exact":    float,
+    "zebra_ae_exact": float,
+    "mse_z":   float,
 }
 ```
 
@@ -471,7 +470,6 @@ of `K`. Shrinking `d_ae` shrinks both the EBM and its diffusion space.
 | `ired/model/diffusion.py` | `GaussianLatentDiffusion` — schedules, losses, sampling |
 | `ired/train_diffusion.py` | Training script (Milestone 2) + `eval_corpus` |
 | `configs/ebm.yaml` | Reference training config |
-| `ired/diagnose_ebm.py` | EBM diagnostics |
 | `docs/autoencoder.md` | The latent space the EBM operates in |
 | `gensis.md` §3.4 | Diffusion / inner-loop design rationale |
 

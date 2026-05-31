@@ -6,15 +6,14 @@
 #
 # Milestone 2 (gensis.md §9): only the EBM updates; the autoencoder (frozen
 # BART + previously trained pool/recon/point-generator) is held fixed. Train on
-# MBPP; eval on MBPP test + HumanEval (held-out).
+# ZebraLogic train split; eval on ZebraLogic test (held-out).
 
 # ── Autoencoder (must match the AE checkpoint) ─────────────────────────────
 # k / pool_type / d_ae are AUTO-OVERRIDDEN from the checkpoint's saved config
-# on load — the values below are only a fallback for older checkpoints. Keep
-# them aligned with configs/ae_conv_pg.yaml to avoid surprises.
+# on load — the values below are only a fallback for older checkpoints.
 model: facebook/bart-base
-ae_ckpt: checkpoints/ae_conv_pg2/ae_latest.pt
-k: 256                       # latent slots (must match AE)
+ae_ckpt: checkpoints/ae_zebra_conv/ae_latest.pt
+k: 384                       # latent slots (must match AE)
 pool_type: conv              # depthwise-separable conv + adaptive pool (must match AE)
 pool_layers: 2
 pool_heads: 8
@@ -35,10 +34,7 @@ opt_step_size: 1.0
 x_start_clamp: 5.0            # clamp predicted x_0 to ±this (<=0 disables)
 envelope_sf: -1.0            # >0 → clamp z to ±sqrt(alpha_bar_t)*sf (IRED uses 2.0)
 
-# Stochastic inner loop (inference only). 0 = deterministic descent + bad-step
-# rejection (IRED default). >0 injects annealed Langevin noise (z ← z − α·∇E +
-# σ·ξ, σ decays to 0 on the last inner step) so the chain can escape shallow
-# minima instead of freezing at the first energy bump. ~1.0 targets p ∝ exp(−E).
+# Stochastic inner loop (inference only).
 opt_noise_scale: 0.0         # try ~0.1 to start
 opt_reject: true             # false + noise>0 → true Langevin (accepts uphill moves)
 
@@ -47,30 +43,25 @@ opt_reject: true             # false + noise>0 → true Langevin (accepts uphill
 no_nce: false                # set true to disable NCE energy-landscape supervision
 nce_scale: 1.0               # λ on the NCE term
 
-# rand-neg anchor: E(real) + margin < E(N(0,I)). Gate to low t — at high t,
-# q(z_t|z_a) and N(0,I) overlap and the anchor fights eps prediction.
+# rand-neg anchor: E(real) + margin < E(N(0,I)).
 rand_neg_weight: 0.0         # 0 disables; recommended start: 1.0
 rand_neg_margin: 1.0
 rand_neg_t_max: 3            # with T=10, low-noise only
 
-# decoder-aux: CE(decode_nocopy(x0_hat), gold) on low-t samples. Grounds the
-# one-step denoising prediction in the inference (no-copy) generator.
+# decoder-aux: CE(decode_nocopy(x0_hat), gold) on low-t samples.
 decoder_aux_weight: 0.0      # 0 disables; recommended start: 0.1
 decoder_aux_t_max: 2
 
-# gen-neg: generator-grounded negative. Decodes the NCE-mined latent through the
-# no-copy (inference) generator; where that decode is wrong (no-copy CE >
-# ce_thresh), pushes E(real) + margin < E(refined). Makes the energy MINIMA
-# coincide with latents the point-generator can actually decode. The decode is a
-# detached gate — gradient flows only through the energy margin (cheap).
+# gen-neg: generator-grounded negative.
 gen_neg_weight: 1.0          # 0 disables; recommended start: 1.0
 gen_neg_margin: 1.0
 gen_neg_t_max: 3             # clean x_0 estimate only reliable at low noise
 gen_neg_ce_thresh: 0.5       # nats/token above which a mined latent is a negative
 
 # ── Training data ──────────────────────────────────────────────────────────
-train_dataset: mbpp
-mbpp_config: full            # full (974) | sanitized (427)
+train_dataset: zebra
+zebra_min_size: 2            # smallest puzzle (houses) to train/eval on
+zebra_max_size: 6            # largest puzzle (houses) to train/eval on
 
 # ── Optimization ───────────────────────────────────────────────────────────
 batch_size: 32
@@ -84,8 +75,8 @@ log_every: 50                # steps between log lines
 eval_every: 500              # steps between end-to-end eval cycles
 
 # ── Eval ───────────────────────────────────────────────────────────────────
-max_q_length: 512            # HumanEval prompts can be long
-max_a_length: 384            # MBPP solutions + HumanEval functions
+max_q_length: 512            # ZebraLogic puzzle clues can be long
+max_a_length: 384            # serialized grid solutions
 eval_n_examples: 80          # per-corpus examples each eval
 
 # ── Infrastructure ─────────────────────────────────────────────────────────
@@ -94,8 +85,6 @@ seed: 0
 device: cuda                 # cuda | cpu
 tui: true                    # Rich+plotext TUI (graphs + scrolling log)
 save_dir: checkpoints/ebm
-# resume: hf://roy-W/ired-reasoning/checkpoints/ebm/ebm_latest.pt
 
 # ── HuggingFace Hub (optional) ─────────────────────────────────────────────
-# push_to_hub: roy-W/ired-reasoning   # repo id; uploads ebm_latest.pt when done
 hub_private: false

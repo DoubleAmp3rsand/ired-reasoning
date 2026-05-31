@@ -13,24 +13,22 @@ Pipeline per step:
 
 Everything except the actor is frozen: the BART encoder/decoder, the AttentionPool
 + ReconstructionNet (loaded from the AE checkpoint), and the EBM (loaded from
-the EBM checkpoint). `p_sample_loop` is run under `no_grad`; `z_final` is a
-plain regression target. That's what makes the actor cheap to train despite the
-teacher's second-order autograd.
+the EBM checkpoint).
 
 Two optional knobs from §5.3:
 
   --replay-buffer-size N   cache (question → z_final) so the slow teacher
-                           rollout amortizes across epochs (one rollout per Q
-                           for the whole training run).
+                           rollout amortizes across epochs.
   --ebm-weight             weight each pair by exp(-E(z_q, z_final, 0)) so the
                            actor preferentially imitates the teacher's confident
-                           converged latents. Cheap — the EBM is already on GPU.
+                           converged latents.
 
 Eval (§5.4 prerequisite): every `eval_every` steps we measure
-  - actor_acc       : one-shot accuracy (decode(actor(z_q)))
-  - ebm_acc         : full Mode-2 accuracy on the same batches (reference)
+  - actor_acc       : one-shot exact-match (decode(actor(z_q)))
+  - ebm_acc         : full Mode-2 exact-match on the same batches (reference)
   - mse_z, corr_z   : actor output vs teacher's z_final on the eval set
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,11 +43,10 @@ from torch.utils.data import DataLoader
 from ired.actor import Actor
 from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
-    HumanEvalDataset,
-    MBPPDataset,
+    ZebraLogicDataset,
     PreTokenizedDataset,
     make_collate_pretokenized,
-    verify_code_batch,
+    zebra_match_batch,
 )
 from ired.model.diffusion import GaussianLatentDiffusion
 from ired.model.energy_net import DiffusionWrapper, EnergyTransformer
@@ -87,15 +84,12 @@ def build_parser():
     p.add_argument("--ebm-weight-tau", type=float, default=1.0,
                    help="temperature on the EBM weighting (w ∝ exp(-E/tau)).")
     p.add_argument("--replay-buffer-size", type=int, default=0,
-                   help=">0 enables an in-memory cache keyed by question text. "
-                        "On hit, skip the teacher rollout.")
+                   help=">0 enables an in-memory cache keyed by question text.")
     # data & opt
-    p.add_argument("--train-dataset", choices=["mbpp"], default="mbpp",
-                   help="Distillation corpus. Must use the same corpus the teacher "
-                        "EBM was trained on so the actor learns to imitate where the "
-                        "teacher is competent.")
-    p.add_argument("--mbpp-config", choices=["full", "sanitized"], default="full",
-                   help="MBPP HF config.")
+    p.add_argument("--train-dataset", choices=["zebra"], default="zebra",
+                   help="Distillation corpus (must match the teacher EBM's corpus).")
+    p.add_argument("--zebra-min-size", type=int, default=2)
+    p.add_argument("--zebra-max-size", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -149,14 +143,7 @@ def teacher_rollout(
     q_input_ids: torch.Tensor | None = None,
     q_attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (z_q, z_final) for the batch. Uses `buffer` when populated.
-
-    Misses on the buffer trigger a single fresh teacher rollout for the missing
-    sub-batch; hits are reused from cache. Both halves are stitched back into
-    the original batch order so the caller never has to think about it.
-
-    Pass `q_input_ids` + `q_attention_mask` to skip the tokenizer call.
-    """
+    """Returns (z_q, z_final) for the batch. Uses `buffer` when populated."""
     if q_input_ids is not None:
         z_q = ae.encode_to_latents_from_ids(q_input_ids, q_attention_mask)
     else:
@@ -192,7 +179,6 @@ def eval_actor_corpus(
     ebm: EnergyTransformer,
     actor: Actor,
     dataset,
-    dataset_name: str,
     device: str,
     max_q_length: int,
     max_a_length: int,
@@ -200,10 +186,10 @@ def eval_actor_corpus(
     n_examples: int = 80,
     batch_size: int = 16,
 ) -> dict:
-    """Joint eval comparing actor (Mode-1) and IRED (Mode-2) on a single corpus.
+    """Joint eval comparing actor (Mode-1) and IRED (Mode-2) on ZebraLogic.
 
-      actor_acc   : per-corpus correctness on decode(actor(z_q))
-      ebm_acc     : per-corpus correctness on decode(p_sample_loop(z_q))
+      actor_acc   : exact-match on decode(actor(z_q))
+      ebm_acc     : exact-match on decode(p_sample_loop(z_q))
       mse_z, corr_z, e_actor, e_teacher: latent/energy diagnostics
     """
     actor.eval()
@@ -238,8 +224,8 @@ def eval_actor_corpus(
         e_actor_sum += ebm(z_q, z_hat, t0).sum().item()
         e_teacher_sum += ebm(z_q, z_final, t0).sum().item()
 
-        ok_actor_l = verify_code_batch(preds_actor, batch_examples)
-        ok_ebm_l   = verify_code_batch(preds_ebm,   batch_examples)
+        ok_actor_l = zebra_match_batch(preds_actor, batch_examples)
+        ok_ebm_l   = zebra_match_batch(preds_ebm,   batch_examples)
         for p_a, p_e, gold, q, ok_a, ok_e in zip(
                 preds_actor, preds_ebm, answers, questions,
                 ok_actor_l, ok_ebm_l):
@@ -334,20 +320,18 @@ def main(argv=None):
 
     # ---- data ----
     print("loading datasets...")
-    train_ds = MBPPDataset(
-        split="train", config=args.mbpp_config, seed=args.seed,
+    train_ds = ZebraLogicDataset(
+        split="train", seed=args.seed,
+        min_size=args.zebra_min_size, max_size=args.zebra_max_size,
     )
-    print(f"  train: MBPP ({len(train_ds)} examples, config={args.mbpp_config})")
+    print(f"  train: ZebraLogic train ({len(train_ds)} examples)")
 
-    mbpp_test_ds = MBPPDataset(
-        split="test", config=args.mbpp_config,
-        max_samples=args.eval_n_examples, seed=args.seed,
+    zebra_test_ds = ZebraLogicDataset(
+        split="test", max_samples=args.eval_n_examples, seed=args.seed,
+        min_size=args.zebra_min_size, max_size=args.zebra_max_size,
     )
-    he_test_ds = HumanEvalDataset(max_samples=args.eval_n_examples, seed=args.seed)
-    print(f"  eval: mbpp_test={len(mbpp_test_ds)}  humaneval={len(he_test_ds)}")
+    print(f"  eval: zebra_test={len(zebra_test_ds)}")
 
-    # Pre-tokenize question once — actor distillation only conditions on z_q,
-    # the answer text is unused at train time (teacher's z_final is the target).
     print("pre-tokenizing train corpus (question)...")
     train_ds = PreTokenizedDataset(
         train_ds, ae.tokenizer,
@@ -398,7 +382,6 @@ def main(argv=None):
             with torch.no_grad():
                 t0_b = torch.zeros(z_q.size(0), device=args.device, dtype=torch.long)
                 e_teacher = ebm(z_q, z_final, t0_b).squeeze(-1)         # (B,)
-                # subtract per-batch min for numerical stability — pure rescaling
                 w = torch.softmax(-e_teacher / args.ebm_weight_tau, dim=0)
                 w = w * w.numel()                                       # mean weight = 1
             loss = (w * per_sample).mean()
@@ -425,50 +408,38 @@ def main(argv=None):
             )
 
         if step % args.eval_every == 0 or step == args.steps:
-            ev_mbpp = eval_actor_corpus(
-                ae, diffusion, ebm, actor, mbpp_test_ds, "mbpp", args.device,
-                args.max_q_length, args.max_a_length, args.inner_steps,
-                n_examples=args.eval_n_examples, batch_size=args.batch_size,
-            )
-            ev_he = eval_actor_corpus(
-                ae, diffusion, ebm, actor, he_test_ds, "humaneval", args.device,
+            ev_zebra = eval_actor_corpus(
+                ae, diffusion, ebm, actor, zebra_test_ds, args.device,
                 args.max_q_length, args.max_a_length, args.inner_steps,
                 n_examples=args.eval_n_examples, batch_size=args.batch_size,
             )
             print(
-                f"  [mbpp n={ev_mbpp['n']}] actor_pass={ev_mbpp['actor_acc']:.3f}  "
-                f"ebm_pass(inner={args.inner_steps})={ev_mbpp['ebm_acc']:.3f}  "
-                f"mse_z={ev_mbpp['mse_z']:.3f}  corr_z={ev_mbpp['corr_z']:+.3f}"
+                f"  [zebra n={ev_zebra['n']}] actor_exact={ev_zebra['actor_acc']:.3f}  "
+                f"ebm_exact(inner={args.inner_steps})={ev_zebra['ebm_acc']:.3f}  "
+                f"mse_z={ev_zebra['mse_z']:.3f}  corr_z={ev_zebra['corr_z']:+.3f}"
             )
             print(
-                f"  [humaneval n={ev_he['n']}] actor_pass={ev_he['actor_acc']:.3f}  "
-                f"ebm_pass(inner={args.inner_steps})={ev_he['ebm_acc']:.3f}  "
-                f"mse_z={ev_he['mse_z']:.3f}  corr_z={ev_he['corr_z']:+.3f}"
-            )
-            print(
-                f"  [energy mbpp] e_actor={ev_mbpp['e_actor']:.2f}  e_teacher={ev_mbpp['e_teacher']:.2f}  "
-                f"gap={ev_mbpp['e_actor'] - ev_mbpp['e_teacher']:+.2f}"
+                f"  [energy] e_actor={ev_zebra['e_actor']:.2f}  "
+                f"e_teacher={ev_zebra['e_teacher']:.2f}  "
+                f"gap={ev_zebra['e_actor'] - ev_zebra['e_teacher']:+.2f}"
             )
 
             def _snip(s, n=120):
                 s = s.replace("\n", " ⏎ ")
                 return s if len(s) <= n else s[:n] + "…"
-            for name, ev in [("mbpp", ev_mbpp), ("humaneval", ev_he)]:
-                for q, gold, p_a, p_e in ev["samples"][:1]:
-                    print(f"    [{name}] Q: {_snip(q)}")
-                    print(f"      gold  : {_snip(gold)}")
-                    print(f"      actor : {_snip(p_a)}")
-                    print(f"      ebm   : {_snip(p_e)}")
+            for q, gold, p_a, p_e in ev_zebra["samples"][:1]:
+                print(f"    [zebra] Q: {_snip(q)}")
+                print(f"      gold  : {_snip(gold)}")
+                print(f"      actor : {_snip(p_a)}")
+                print(f"      ebm   : {_snip(p_e)}")
 
             ck = {
                 "actor": actor.state_dict(),
                 "config": vars(args),
                 "step": step,
-                "mbpp_actor_pass": ev_mbpp["actor_acc"],
-                "mbpp_ebm_pass": ev_mbpp["ebm_acc"],
-                "humaneval_actor_pass": ev_he["actor_acc"],
-                "humaneval_ebm_pass": ev_he["ebm_acc"],
-                "mse_z_mbpp": ev_mbpp["mse_z"],
+                "zebra_actor_exact": ev_zebra["actor_acc"],
+                "zebra_ebm_exact": ev_zebra["ebm_acc"],
+                "mse_z": ev_zebra["mse_z"],
             }
             torch.save(ck, os.path.join(args.save_dir, f"actor_step{step}.pt"))
             torch.save(ck, os.path.join(args.save_dir, "actor_latest.pt"))

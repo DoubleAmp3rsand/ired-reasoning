@@ -22,10 +22,10 @@ Everything the EBM learns lives inside the latent space the AE defines.
 ```
 
 The AE is trained first (Milestone 1 in `gensis.md` §7), then frozen while
-the EBM is trained. The AE is deliberately **never trained on the EBM's code
-corpora** — it trains on OpenWebText only, preserving the anchoring property
-(`gensis.md` §3.2): the latent image of the gold answer `z_a = f_φ(Enc(A))`
-is structurally fixed and cannot drift with EBM training.
+the EBM is trained. The AE is deliberately **never trained on the EBM's
+ZebraLogic corpus** — it trains on OpenWebText only, preserving the anchoring
+property (`gensis.md` §3.2): the latent image of the gold answer
+`z_a = f_φ(Enc(A))` is structurally fixed and cannot drift with EBM training.
 
 ---
 
@@ -75,7 +75,7 @@ text ◄── BART Decoder ◄── ReconstructionNet (f_ψ) ◄────�
 > latent — there is *no* source to copy from — so the copy path was inert at
 > inference, while during AE training (and its eval, which passed the gold
 > answer as the copy source) it let the decoder copy the target verbatim. That
-> inflated reconstruction metrics (~95% MBPP) without forcing the latent to
+> inflated reconstruction metrics (~95% on code benchmarks) without forcing the latent to
 > carry the code, leaving the true latent-only decode — the only path the EBM
 > can use — near 0%. The decoder now always generates from the latent alone.
 
@@ -206,7 +206,7 @@ there is no copy/source term.
 ### Dataset
 
 **OpenWebText** — a broad natural-language corpus. The AE is deliberately
-**never trained on MBPP or HumanEval**, preserving the §3.2 anchoring
+**never trained on ZebraLogic puzzles**, preserving the §3.2 anchoring
 property: the latent image of the gold answer is fixed and the EBM cannot
 exploit AE-learned distribution bias.
 
@@ -215,24 +215,21 @@ exploit AE-learned distribution bias.
 | Metric | What it measures |
 |--------|-----------------|
 | `owt_recon_cer` | Char error rate on held-out OpenWebText. Smooth signal; 0 = exact byte-level reconstruction. |
-| `mbpp_cer` | Same CER, on MBPP canonical solutions. Proxy for code recon before pass-rate moves. |
-| `mbpp_pass` | Fraction of MBPP examples where the round-tripped solution passes its `test_list`. |
-| `humaneval_cer` | Same CER, on HumanEval prompt+canonical. |
-| `humaneval_pass` | Fraction of HumanEval examples where the decoded function passes `check(entry_point)`. |
+| `zebra_recon_cer` | Same CER, on ZebraLogic gold grid serializations. Smooth early signal. |
+| `zebra_exact` | Fraction of ZebraLogic puzzles where the round-tripped grid matches the gold assignment exactly. |
 
-CER gives a smooth signal early in training; pass-rate is the downstream-relevant
-metric. A function can have low CER (few chars off) but still fail execution if
-the drift hit an operator or identifier.
+CER gives a smooth signal early in training; exact match is the downstream-relevant
+metric. A grid can have low CER (few chars off) but still fail exact match if the
+drift hit a house assignment or attribute value.
 
 ### Milestone 1 gate (gensis.md §7)
 
-- MBPP test pass-rate ≥ 80%
-- HumanEval pass-rate ≥ 80%
+- ZebraLogic exact-match ≥ 80%
 - OpenWebText byte-exact reconstruction ≥ 50%
 
-If the AE clears OWT but fails both code bars, the OWT-trained latent space
-doesn't transfer to Python — recovery options are (a) add a code slice to AE
-pretraining, or (b) swap BART for CodeBERT/CodeT5.
+If the AE clears OWT but fails the zebra bar, the OWT-trained latent space
+doesn't transfer to structured grid outputs — recovery options are (a) add a
+synthetic grid slice to AE pretraining, or (b) increase K / decoder fine-tuning.
 
 ---
 
@@ -396,7 +393,7 @@ identifiers/literals verbatim from a source. It backfired for this pipeline:
 the EBM generates from a latent with **no source available**, so the copy path
 is inert at inference. During AE training the copy source was the gold answer,
 so the decoder learned to copy the target instead of encoding it into the
-latent — the AE's reported pass-rate (~95% MBPP / ~73% HumanEval) was achieved
+latent — the AE's reported pass-rate (~95% on code benchmarks / ~73% on held-out eval) was achieved
 *with the answer in hand*, while the latent-only decode the EBM actually uses
 scored ~0%. Because the EBM can never beat the AE's latent-only ceiling, the
 copy head made the AE look good and the EBM impossible to train. Removed; the
@@ -471,10 +468,9 @@ expected at step 0. If loss stays above 5 after the first eval cycle,
 check: (a) BART encoder is actually frozen, (b) gradient is flowing to pool
 and recon parameters, (c) learning rate isn't too low (default `1e-4`).
 
-**MBPP pass-rate is high but HumanEval pass-rate is near zero.**
-HumanEval prompts are longer (signature + docstring + examples → up to 512
-tokens). The AE may be losing information for long inputs. Increase
-`max_length` or `K`.
+**ZebraLogic exact-match is high on small puzzles but near zero on larger ones.**
+Larger puzzles (5×5, 6×6) have longer grid serializations. The AE may be losing
+information for long inputs. Increase `max_a_length` or `K`.
 
 **Checkpoint load fails with "d_ae mismatch".**
 The checkpoint was saved with a different `d_ae`. Reconstruct the AE with
