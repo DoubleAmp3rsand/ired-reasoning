@@ -4,9 +4,11 @@
 # CLI args override config values, so e.g. `--seed 42` on the command line
 # wins over the `seed: 0` below.
 #
-# Milestone 2 (gensis.md §9): only the EBM updates; the autoencoder (frozen
-# BART + previously trained pool/recon/point-generator) is held fixed. Train on
-# ZebraLogic train split; eval on ZebraLogic test (held-out).
+# Milestone 2 (gensis.md §7): only the EBM updates; the autoencoder (frozen
+# BART + previously trained pool/recon) is held fixed. Train on the synthetic
+# clue generator (ired/puzzle_gen.py); eval on a DIFFERENT generator — held-out
+# WildEval/ZebraLogic prose (transfer) + larger synthetic puzzles (length-gen).
+# The inner-gap (acc − acc_inner0) is the reasoning-vs-fitting discriminator.
 
 # ── Autoencoder (must match the AE checkpoint) ─────────────────────────────
 # k / pool_type / d_ae are AUTO-OVERRIDDEN from the checkpoint's saved config
@@ -28,8 +30,8 @@ ebm_ff_mult: 4
 
 # ── Diffusion / inner-loop ─────────────────────────────────────────────────
 timesteps: 10
-inner_steps: 5               # IRED opt_step refinements per outer DDPM step
-beta_schedule: linear        # linear | cosine
+inner_steps: 20              # IRED opt_step refinements per outer DDPM step
+beta_schedule: cosine        # cosine (linear removed)
 opt_step_size: 1.0
 x_start_clamp: 5.0            # clamp predicted x_0 to ±this (<=0 disables)
 envelope_sf: -1.0            # >0 → clamp z to ±sqrt(alpha_bar_t)*sf (IRED uses 2.0)
@@ -58,10 +60,23 @@ gen_neg_margin: 1.0
 gen_neg_t_max: 3             # clean x_0 estimate only reliable at low noise
 gen_neg_ce_thresh: 0.5       # nats/token above which a mined latent is a negative
 
-# ── Training data ──────────────────────────────────────────────────────────
-train_dataset: zebra
-zebra_min_size: 2            # smallest puzzle (houses) to train/eval on
-zebra_max_size: 6            # largest puzzle (houses) to train/eval on
+# ── Training data — synthetic clue generator (different from the eval) ───────
+clue_samples: 20000          # synthetic clue puzzles to materialize for training
+clue_min_size: 2             # train puzzle size band (houses)...
+clue_max_size: 4             # ...eval-2 tests generalization ABOVE this
+clue_min_attrs: 3
+clue_max_attrs: 5
+clue_min_level: 5            # generator difficulty (WildEval-aligned relations)
+clue_max_level: 8
+clue_minimize_seconds: 2.0   # per-puzzle clue-minimization cap
+
+# ── Eval-1 (primary): held-out WildEval prose — generator→WildEval transfer ──
+zebra_min_size: 2            # smallest WildEval puzzle (houses) to eval on
+zebra_max_size: 6            # largest WildEval puzzle (houses) to eval on
+
+# ── Eval-2: generator puzzles above the training band — length generalization ─
+gen_eval_min_size: 5
+gen_eval_max_size: 6
 
 # ── Optimization ───────────────────────────────────────────────────────────
 batch_size: 32

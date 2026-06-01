@@ -4,10 +4,11 @@ the frozen BART decoder can round-trip text through K latent slots.
 The whole BART model stays frozen. Only the pool's + recon's parameters update.
 
 Task substrate: **ZebraLogic** — natural-language logic-grid puzzles. The AE
-trains on **OpenWebText** (natural-language pretraining corpus) and is evaluated
-on held-out **ZebraLogic** puzzles by puzzle-level exact match. ZebraLogic is
-*never* used for training, so the latent space is not shaped by the eval
-distribution (gensis §2.2 anchoring).
+trains on **OpenWebText + synthetic logic-grid solutions** (random grids for
+format exposure, mixed at `--zebra-mix-ratio`) and is evaluated on held-out
+**ZebraLogic** puzzles by puzzle-level exact match. ZebraLogic is *never* used
+for training, so the latent space is not shaped by the eval distribution
+(gensis §2.2 anchoring).
 
 Metrics per eval cycle:
   - owt_recon_cer      CER (torchmetrics) of decoded OpenWebText vs gold.
@@ -46,7 +47,9 @@ from torchmetrics.text import CharErrorRate
 
 from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
+    MixedDataset,
     OpenWebTextDataset,
+    SyntheticZebraGridDataset,
     ZebraLogicDataset,
     ZebraLogicVerifier,
     collate,
@@ -86,6 +89,16 @@ def build_parser():
                    help="hard char truncation before tokenization.")
     p.add_argument("--owt-eval-samples", type=int, default=256,
                    help="size of the held-out OpenWebText eval slice.")
+    p.add_argument("--zebra-mix-ratio", type=float, default=0.5,
+                   help="fraction of AE training examples drawn from synthetic "
+                        "ZebraLogic-style grids (SyntheticZebraGridDataset); the "
+                        "rest from OpenWebText. The synthetic grids are random "
+                        "assignments — disjoint from the WildEval/ZebraLogic eval "
+                        "puzzles, so anchoring holds. 0 = pure OWT.")
+    p.add_argument("--zebra-samples", type=int, default=50_000,
+                   help="number of synthetic grids to materialize.")
+    p.add_argument("--mixed-length", type=int, default=200_000,
+                   help="virtual length of the OWT+grids mixed dataset.")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -358,6 +371,30 @@ def main(argv=None):
             seed=args.seed,
         )
         r.log(f"  materialized {len(train_ds)} OWT docs")
+
+        # Optionally mix in synthetic ZebraLogic grids for format exposure.
+        if args.zebra_mix_ratio > 0.0:
+            r.log(
+                f"  + synthetic ZebraLogic grids (materializing {args.zebra_samples}, "
+                f"sizes {args.zebra_min_size}–{args.zebra_max_size}, "
+                f"mix ratio={args.zebra_mix_ratio:.2f})"
+            )
+            grid_ds = SyntheticZebraGridDataset(
+                max_samples=args.zebra_samples,
+                min_size=args.zebra_min_size,
+                max_size=args.zebra_max_size,
+                seed=args.seed,
+            )
+            r.log(f"  materialized {len(grid_ds)} synthetic grids")
+            train_ds = MixedDataset(
+                datasets=[train_ds, grid_ds],
+                weights=[1.0 - args.zebra_mix_ratio, args.zebra_mix_ratio],
+                length=args.mixed_length,
+            )
+            r.log(
+                f"  mixed train dataset: virtual length {len(train_ds)} "
+                f"({(1.0 - args.zebra_mix_ratio):.0%} OWT + {args.zebra_mix_ratio:.0%} grids)"
+            )
 
         # Held-out OWT slice (different seed → effectively disjoint).
         r.log(f"  building OWT eval slice ({args.owt_eval_samples} docs, seed={args.seed + 1})")

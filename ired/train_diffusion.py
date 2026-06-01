@@ -13,6 +13,20 @@ Only the EBM updates. The autoencoder (frozen BART + previously trained pool) is
 held fixed. Every `eval_every` steps we sample end-to-end and report per-corpus
 exact-match rates on ZebraLogic puzzles (puzzle-level grid comparison).
 
+Data protocol (gensis.md §7 — "reasoning, not generator-fitting")
+-----------------------------------------------------------------
+`WildEval/ZebraLogic` ships only a 1000-puzzle *test* split, so the EBM trains on
+a **different** generator: `ClueZebraGridDataset` synthesizes unlimited fresh
+`(prose clues, unique solution)` pairs (`ired/puzzle_gen.py`), eval-disjoint by
+construction. Two evals keep us honest:
+  - eval-1 (primary): held-out WildEval prose — generator→WildEval *transfer*,
+    so a model that merely fit the training generator cannot score.
+  - eval-2: generator puzzles at *larger* sizes than training — length
+    generalization.
+On both, the headline discriminator is the **inner-gap** `acc − acc_inner0`:
+iterative energy descent beating single-shot is the evidence of reasoning rather
+than disguised lookup.
+
 Loss terms (see GaussianLatentDiffusion.p_losses)
 -------------------------------------------------
 Always on:
@@ -43,6 +57,7 @@ from torch.utils.data import DataLoader
 
 from ired.model.autoencoder import FrozenBartAutoencoder
 from ired.data import (
+    ClueZebraGridDataset,
     ZebraLogicDataset,
     PreTokenizedDataset,
     make_collate_pretokenized,
@@ -100,7 +115,7 @@ def build_parser():
     # diffusion
     p.add_argument("--timesteps", type=int, default=10)
     p.add_argument("--inner-steps", type=int, default=5)
-    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="linear")
+    p.add_argument("--beta-schedule", choices=["cosine"], default="cosine")
     p.add_argument("--opt-step-size", type=float, default=1.0)
     p.add_argument("--opt-noise-scale", type=float, default=0.0)
     p.add_argument("--opt-reject", action=argparse.BooleanOptionalAction, default=True)
@@ -120,12 +135,28 @@ def build_parser():
     p.add_argument("--gen-neg-t-max", type=int, default=3)
     p.add_argument("--gen-neg-ce-thresh", type=float, default=0.5)
     # data & opt
-    p.add_argument("--train-dataset", choices=["zebra"], default="zebra",
-                   help="Corpus the EBM trains on (ZebraLogic).")
+    # Train corpus: synthetic clue puzzles (different generator than the eval).
+    p.add_argument("--clue-samples", type=int, default=20000,
+                   help="synthetic clue puzzles to materialize for training.")
+    p.add_argument("--clue-min-size", type=int, default=2,
+                   help="smallest training puzzle (houses).")
+    p.add_argument("--clue-max-size", type=int, default=4,
+                   help="largest training puzzle (houses); eval-2 tests above this.")
+    p.add_argument("--clue-min-attrs", type=int, default=3)
+    p.add_argument("--clue-max-attrs", type=int, default=5)
+    p.add_argument("--clue-min-level", type=int, default=5,
+                   help="generator difficulty floor (WildEval-aligned relation set).")
+    p.add_argument("--clue-max-level", type=int, default=8)
+    p.add_argument("--clue-minimize-seconds", type=float, default=2.0,
+                   help="per-puzzle cap for clue-count minimization.")
+    # eval-1 (primary): held-out WildEval prose — generator→WildEval transfer.
     p.add_argument("--zebra-min-size", type=int, default=2,
-                   help="smallest puzzle (houses) to train/eval on.")
+                   help="smallest WildEval puzzle (houses) to eval on.")
     p.add_argument("--zebra-max-size", type=int, default=6,
-                   help="largest puzzle (houses) to train/eval on.")
+                   help="largest WildEval puzzle (houses) to eval on.")
+    # eval-2: generator puzzles ABOVE the training size band — length generalization.
+    p.add_argument("--gen-eval-min-size", type=int, default=5)
+    p.add_argument("--gen-eval-max-size", type=int, default=6)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
@@ -247,6 +278,7 @@ def main(argv=None):
         use_tui=args.tui,
         eval_series=(
             "zebra_exact", "zebra_exact_inner0", "zebra_ae_exact",
+            "gen_exact", "gen_exact_inner0",
         ),
         title="train_diffusion",
     ) as r:
@@ -360,19 +392,40 @@ def main(argv=None):
         n_params = sum(p.numel() for p in ebm.parameters())
         r.log(f"ebm params: {n_params:,}  (diffuses in d_ae={d_diff}, layers={args.ebm_layers})")
 
-        # data — train on ZebraLogic train split; eval on test (held-out).
+        # data — train on the synthetic clue generator; eval on a DIFFERENT
+        # generator (WildEval, held-out prose) plus larger synthetic puzzles.
         r.log("loading datasets...")
-        train_ds = ZebraLogicDataset(
-            split="train", seed=args.seed,
-            min_size=args.zebra_min_size, max_size=args.zebra_max_size,
+        r.log(f"generating {args.clue_samples} synthetic clue puzzles "
+              f"(sizes {args.clue_min_size}-{args.clue_max_size}, "
+              f"levels {args.clue_min_level}-{args.clue_max_level})...")
+        train_ds = ClueZebraGridDataset(
+            max_samples=args.clue_samples,
+            min_size=args.clue_min_size, max_size=args.clue_max_size,
+            min_attrs=args.clue_min_attrs, max_attrs=args.clue_max_attrs,
+            min_level=args.clue_min_level, max_level=args.clue_max_level,
+            max_seconds_for_minimizing=args.clue_minimize_seconds,
+            seed=args.seed,
         )
-        r.log(f"train dataset: ZebraLogic train ({len(train_ds)} examples)")
+        r.log(f"train dataset: ClueZebraGrid ({len(train_ds)} puzzles)")
 
+        # eval-1 (primary): held-out WildEval prose — the transfer test.
         zebra_test_ds = ZebraLogicDataset(
             split="test", max_samples=args.eval_n_examples, seed=args.seed,
             min_size=args.zebra_min_size, max_size=args.zebra_max_size,
         )
-        r.log(f"eval dataset: ZebraLogic test ({len(zebra_test_ds)} examples)")
+        r.log(f"eval-1 (transfer): WildEval/ZebraLogic test ({len(zebra_test_ds)} puzzles)")
+
+        # eval-2: generator puzzles above the training size band.
+        gen_eval_ds = ClueZebraGridDataset(
+            max_samples=args.eval_n_examples,
+            min_size=args.gen_eval_min_size, max_size=args.gen_eval_max_size,
+            min_attrs=args.clue_min_attrs, max_attrs=args.clue_max_attrs,
+            min_level=args.clue_min_level, max_level=args.clue_max_level,
+            max_seconds_for_minimizing=args.clue_minimize_seconds,
+            seed=args.seed + 1,
+        )
+        r.log(f"eval-2 (length-gen): ClueZebraGrid sizes "
+              f"{args.gen_eval_min_size}-{args.gen_eval_max_size} ({len(gen_eval_ds)} puzzles)")
 
         # Pre-tokenize question + answer once so the train hot loop never
         # touches the (single-threaded) BART tokenizer.
@@ -511,17 +564,32 @@ def main(argv=None):
                     args.max_q_length, args.max_a_length, args.inner_steps,
                     n_examples=args.eval_n_examples, batch_size=args.batch_size,
                 )
+                ev_gen = eval_corpus(
+                    ae, diffusion, gen_eval_ds, args.device,
+                    args.max_q_length, args.max_a_length, args.inner_steps,
+                    n_examples=args.eval_n_examples, batch_size=args.batch_size,
+                )
+                z_gap = ev_zebra["acc"] - ev_zebra["acc_inner0"]
+                g_gap = ev_gen["acc"] - ev_gen["acc_inner0"]
                 r.eval_point(
                     step,
                     zebra_exact=ev_zebra["acc"],
                     zebra_exact_inner0=ev_zebra["acc_inner0"],
                     zebra_ae_exact=ev_zebra["ae_acc"],
+                    gen_exact=ev_gen["acc"],
+                    gen_exact_inner0=ev_gen["acc_inner0"],
                 )
                 r.log(
-                    f"  [eval zebra n={ev_zebra['n']}] "
-                    f"zebra_exact(inner={args.inner_steps})={ev_zebra['acc']:.3f}  "
-                    f"zebra_exact(inner=0)={ev_zebra['acc_inner0']:.3f}  "
-                    f"zebra_ae_exact={ev_zebra['ae_acc']:.3f}"
+                    f"  [eval-1 transfer/WildEval n={ev_zebra['n']}] "
+                    f"exact(inner={args.inner_steps})={ev_zebra['acc']:.3f}  "
+                    f"exact(inner=0)={ev_zebra['acc_inner0']:.3f}  "
+                    f"inner-gap={z_gap:+.3f}  ae_exact={ev_zebra['ae_acc']:.3f}"
+                )
+                r.log(
+                    f"  [eval-2 length-gen n={ev_gen['n']}] "
+                    f"exact(inner={args.inner_steps})={ev_gen['acc']:.3f}  "
+                    f"exact(inner=0)={ev_gen['acc_inner0']:.3f}  "
+                    f"inner-gap={g_gap:+.3f}  ae_exact={ev_gen['ae_acc']:.3f}"
                 )
                 r.log(
                     f"  [latent] mse_z={ev_zebra['mse_z']:.3f}  "
@@ -531,6 +599,9 @@ def main(argv=None):
                 )
                 if ev_zebra["ae_acc"] < 0.5:
                     r.log("  [!] ae_exact < 0.5 — Milestone 1 (AE) is the bottleneck.")
+                if z_gap <= 0 and ev_zebra["acc"] > 0:
+                    r.log("  [!] inner-gap ≤ 0 on WildEval — optimization not beating "
+                          "single-shot (gensis §7: lookup, not reasoning).")
 
                 def _snip(s, n=120):
                     s = s.replace("\n", " ⏎ ")
@@ -550,7 +621,10 @@ def main(argv=None):
                     "config": vars(args),
                     "step": step,
                     "zebra_exact": ev_zebra["acc"],
+                    "zebra_exact_inner0": ev_zebra["acc_inner0"],
                     "zebra_ae_exact": ev_zebra["ae_acc"],
+                    "gen_exact": ev_gen["acc"],
+                    "gen_exact_inner0": ev_gen["acc_inner0"],
                     "mse_z": ev_zebra["mse_z"],
                 }
                 torch.save(ck, os.path.join(args.save_dir, f"ebm_step{step}.pt"))

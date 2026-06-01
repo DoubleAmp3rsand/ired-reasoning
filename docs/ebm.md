@@ -149,7 +149,7 @@ Owns the DDPM schedules and all of training + sampling. Key construction knobs
 | Knob | Meaning |
 |------|---------|
 | `timesteps` (10) | number of outer DDPM steps `T` |
-| `beta_schedule` ("linear") | `linear` or `cosine`; validated so `alpha_cumprod > 0` |
+| `beta_schedule` ("cosine") | `cosine` only (linear removed — it goes NaN at small `T`); validated so `alpha_cumprod > 0` |
 | `opt_step_size` (1.0) | inner-loop gradient-descent step size (per-`t` buffer) |
 | `opt_noise_scale` (0.0) | Langevin/SGLD noise on the inference inner loop; `0` = deterministic (§5.1.1) |
 | `opt_reject` (True) | keep the monotone bad-step filter; `False` + noise = true Langevin (§5.1.1) |
@@ -235,27 +235,45 @@ collapses toward zero regardless of latent quality and the EBM gets no usable
 signal. `copy=False` matches `ae.decode(z, src_texts=None)`, the path actually
 run at EBM inference.
 
-### 4.4 Dataset
+### 4.4 Dataset (train ≠ eval generator — `gensis.md` §7)
 
-Trains on **ZebraLogic** train split. Evaluates on **ZebraLogic test** (held out).
-ZebraLogic test is never trained on. The AE was never trained on it either
-(`gensis.md` §3.2 anchoring), so the gold-answer latent is a fixed target the
-EBM cannot exploit via AE distribution bias.
+`WildEval/ZebraLogic` ships **only a 1000-puzzle `test` split** — there is no
+ZebraLogic train split — and `SyntheticZebraGridDataset` carries no clues, so
+neither can train a solver. The EBM therefore trains on a **different
+generator**:
 
-### 4.5 Metrics (per eval cycle, `eval_corpus`)
+- **Train:** `ClueZebraGridDataset` (`ired/data.py` → `ired/puzzle_gen.py`, the
+  vendored quint-t generator, **non-commercial**). It samples a random solution
+  over generic value pools (eval-disjoint by construction, so anchoring §3.2
+  holds) and emits a minimal, uniqueness-verified clue set, **prose-rendered**
+  into ZebraLogic-style sentences (keeps the problem "irreducibly NL",
+  `gensis.md` §5.5/§8). Default band: sizes 2–4, levels 5–8.
+- **Eval-1 (primary, transfer):** held-out **WildEval/ZebraLogic** prose. Because
+  it's a *different* generator, a model that merely fit the training generator's
+  regularities cannot score — transfer is the evidence of solving.
+- **Eval-2 (length generalization):** `ClueZebraGridDataset` at sizes **above**
+  the training band (default 5–6).
+
+The AE is never trained on any of these (anchoring), so the gold-answer latent is
+a fixed target the EBM cannot exploit via AE distribution bias.
+
+### 4.5 Metrics (per eval cycle, `eval_corpus` × {eval-1, eval-2})
 
 End-to-end: sample `z` from `z_q`, decode, compare the decoded grid against the
-gold solution by puzzle-level exact match.
+gold solution by puzzle-level exact match (`zebra_match`, **snap=True** — grades
+the closed-vocabulary assignment, §5.5).
 
 | Metric | Meaning |
 |--------|---------|
 | `acc` | exact-match rate with full `inner_steps` of refinement |
 | `acc_inner0` | exact-match rate with `inner_steps=0` — isolates the gain from `opt_step` |
+| **inner-gap** `acc − acc_inner0` | **the headline discriminator** (§7): iterative descent beating single-shot is the evidence of *reasoning* rather than disguised lookup. Reported for both evals; a warning fires when it's ≤0 on WildEval. |
 | `ae_acc` | exact-match rate of `decode(encode(answer))` — the Milestone-1 AE ceiling |
 | `mse_z`, `corr_z` | L2 / cosine of sampled latent vs `z_a` |
 | `std_za`, `std_zs` | element-std of gold vs sampled latents (scale drift) |
 
-`ae_acc < 0.5` means the **AE is the bottleneck**, not the EBM.
+Logged as `zebra_*` (eval-1) and `gen_*` (eval-2). `ae_acc < 0.5` means the
+**AE is the bottleneck**, not the EBM.
 
 ---
 
@@ -347,7 +365,7 @@ diffusion = GaussianLatentDiffusion(
     model=wrapper,
     latent_shape=(K, d_ae),
     timesteps=10,
-    beta_schedule="linear",
+    beta_schedule="cosine",
     opt_step_size=1.0,
     opt_noise_scale=0.0,            # >0 → Langevin inner loop (inference only)
     opt_reject=True,                # False + noise → accept uphill moves
@@ -433,8 +451,11 @@ Saved each eval cycle to `ebm_step{N}.pt` and `ebm_latest.pt`:
     "latent_sigma": tensor,       # (d_ae,) normalization scale
     "config":       vars(args),   # full training config
     "step":         int,
-    "zebra_exact":    float,
-    "zebra_ae_exact": float,
+    "zebra_exact":         float, # eval-1 (WildEval transfer), inner=N
+    "zebra_exact_inner0":  float, # eval-1, inner=0 (→ inner-gap)
+    "zebra_ae_exact":      float, # eval-1 AE ceiling
+    "gen_exact":           float, # eval-2 (length-gen), inner=N
+    "gen_exact_inner0":    float, # eval-2, inner=0
     "mse_z":   float,
 }
 ```
@@ -501,4 +522,3 @@ computed (sampling in an un-normalized space miscalibrates the schedule).
 **RuntimeError about double-backward / SDPA kernel.** The energy forward must use
 the MATH SDPA backend so `∇E` is twice-differentiable. This is forced inside
 `EnergyTransformer.forward`; don't wrap training in a competing `sdpa_kernel`.
-```

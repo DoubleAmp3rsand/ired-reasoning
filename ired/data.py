@@ -19,13 +19,21 @@ ZebraLogic corpus (the current task):
   gold solution. Unlike the old Spider/SQL path there is no database lifecycle:
   the unique gold solution ships with every example, so verification is a pure
   structural comparison.
+- `SyntheticZebraGridDataset` — random ZebraLogic-style solution grids for AE
+  format exposure. Contamination-free by construction (random assignments over
+  generic value pools), so it can be mixed into AE training without touching the
+  anchoring property. Its sole job is to teach the frozen-BART AE the grid
+  surface form — the anchoring-safe analog of mixing synthetic SQL.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import random
 import re
+from difflib import SequenceMatcher
 
 import numpy as np
 import torch
@@ -102,8 +110,13 @@ _ZEBRA_LINE_RE = re.compile(r"house\s+(\w+)\s*:\s*(.*)", re.IGNORECASE)
 
 
 def zebra_normalize(s) -> str:
-    """Collapse whitespace + lowercase — the cell-comparison canonical form."""
-    return re.sub(r"\s+", " ", str(s)).strip().lower()
+    """Collapse whitespace + lowercase + strip surrounding punctuation — the
+    cell-comparison canonical form. The surrounding-punctuation strip clears the
+    transduction scaffolding noise the AE emits (`"arnold`, `/soup`, `water `)
+    so it doesn't fail a solved cell (gensis §5.5); internal spaces/hyphens (e.g.
+    "grilled cheese") are preserved."""
+    s = re.sub(r"\s+", " ", str(s)).strip().lower()
+    return re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", s)
 
 
 def serialize_zebra_solution(solution: dict) -> str:
@@ -136,10 +149,14 @@ def parse_zebra_solution(text: str):
         house = zebra_normalize(m.group(1))
         cells: dict[str, str] = {}
         for part in m.group(2).split(","):
-            if "=" not in part:
+            # Split into leading attribute token + value on whatever separator
+            # survived ('=', or a corrupted '/' '-' or bare space) — so a mangled
+            # delimiter degrades to a snappable key/value, not a dropped cell.
+            km = re.match(r"[^a-z0-9]*([a-z0-9][a-z0-9 -]*?)[^a-z0-9]+(.+)$",
+                          part.strip(), re.IGNORECASE)
+            if not km:
                 continue
-            k, v = part.split("=", 1)
-            cells[zebra_normalize(k)] = zebra_normalize(v)
+            cells[zebra_normalize(km.group(1))] = zebra_normalize(km.group(2))
         if cells:
             mapping[house] = cells
     return mapping or None
@@ -158,15 +175,70 @@ def zebra_gold_mapping(solution: dict) -> dict[str, dict[str, str]]:
     return mapping
 
 
-def zebra_match(pred_text: str, gold_solution: dict) -> bool:
+def zebra_gold_alphabet(solution: dict):
+    """Closed answer alphabet for a puzzle: legal house ids, legal attribute
+    keys, and the legal value set per attribute — all normalized. This is the
+    `{house, attr, value}` vocabulary the puzzle itself fixes (and what makes it
+    uniquely solvable), so snapping decoded cells onto it (gensis §5.5) repairs
+    transduction noise without inventing answers."""
+    header = solution["header"]
+    attrs = header[1:]
+    legal_attrs = [zebra_normalize(a) for a in attrs]
+    legal_vals: dict[str, set] = {za: set() for za in legal_attrs}
+    for row in solution["rows"]:
+        for a, v in zip(attrs, row[1:]):
+            legal_vals[zebra_normalize(a)].add(zebra_normalize(v))
+    legal_houses = [zebra_normalize(row[0]) for row in solution["rows"]]
+    return legal_attrs, legal_vals, legal_houses
+
+
+def _snap_to_legal(token: str, candidates, *, threshold: float = 0.6,
+                   margin: float = 0.15) -> str:
+    """Snap a decoded token to its nearest legal candidate (gensis §5.5).
+
+    Returns the token unchanged when it is already legal, or when the match is
+    *ambiguous* — nearest below `threshold`, or within `margin` of the runner-up.
+    That ambiguity guard is the §5.2 protection: transduction corruption is
+    off-vocabulary so it snaps cleanly, but a genuine reasoning error is a
+    *different legal value* (exact, so returned as-is → still fails) or a true
+    near-miss between two legal values (ambiguous → left raw → still fails). It
+    forgives surface noise without laundering a wrong assignment."""
+    cand = list(candidates)
+    if not cand or token in cand:
+        return token
+    scored = sorted((SequenceMatcher(None, token, c).ratio(), c) for c in cand)
+    best_r, best_c = scored[-1]
+    second_r = scored[-2][0] if len(scored) > 1 else 0.0
+    if best_r >= threshold and (best_r - second_r) >= margin:
+        return best_c
+    return token
+
+
+def zebra_match(pred_text: str, gold_solution: dict, *, snap: bool = True) -> bool:
     """Puzzle-level exact match: every gold (house, attr) cell must be present
     and equal in the decoded answer. ZebraLogic solutions are unique, so this
     all-or-nothing check *is* the correctness metric (an unparseable or
-    partially-correct grid is not a solved puzzle)."""
+    partially-correct grid is not a solved puzzle).
+
+    With `snap=True` (default) each decoded house/attr/value is first snapped to
+    the puzzle's known alphabet (gensis §5.5) so serialization noise doesn't fail
+    a solved grid; `snap=False` recovers the strict byte-literal metric."""
     gold = zebra_gold_mapping(gold_solution)
     pred = parse_zebra_solution(pred_text)
     if not pred:
         return False
+    if snap:
+        legal_attrs, legal_vals, legal_houses = zebra_gold_alphabet(gold_solution)
+        snapped: dict[str, dict[str, str]] = {}
+        for house, cells in pred.items():
+            sh = _snap_to_legal(house, legal_houses)
+            scells: dict[str, str] = {}
+            for k, v in cells.items():
+                sk = _snap_to_legal(k, legal_attrs)
+                sv = _snap_to_legal(v, legal_vals.get(sk, ()))
+                scells[sk] = sv
+            snapped[sh] = scells
+        pred = snapped
     for house, cells in gold.items():
         pcells = pred.get(house)
         if pcells is None:
@@ -177,9 +249,11 @@ def zebra_match(pred_text: str, gold_solution: dict) -> bool:
     return True
 
 
-def zebra_match_batch(preds: list[str], batch: list[dict]) -> list[bool]:
+def zebra_match_batch(preds: list[str], batch: list[dict], *,
+                      snap: bool = True) -> list[bool]:
     """`preds` paired with ZebraLogic example dicts carrying `_solution`."""
-    return [zebra_match(p, ex["_solution"]) for p, ex in zip(preds, batch)]
+    return [zebra_match(p, ex["_solution"], snap=snap)
+            for p, ex in zip(preds, batch)]
 
 
 class ZebraLogicVerifier:
@@ -192,8 +266,13 @@ class ZebraLogicVerifier:
     `verify_batch(preds, batch)`), and as the seat for future partial
     cell-accuracy scoring."""
 
+    def __init__(self, snap: bool = True):
+        # snap=True grades the closed-vocabulary assignment (gensis §5.5);
+        # snap=False is the strict byte-literal metric.
+        self.snap = snap
+
     def verify_one(self, pred: str, solution: dict) -> bool:
-        return zebra_match(pred, solution)
+        return zebra_match(pred, solution, snap=self.snap)
 
     def verify_batch(self, preds: list[str], batch: list[dict]) -> list[bool]:
         return [self.verify_one(p, ex["_solution"]) for p, ex in zip(preds, batch)]
@@ -242,6 +321,200 @@ class ZebraLogicDataset(Dataset):
             })
             if max_samples is not None and len(self.examples) >= max_samples:
                 break
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[int(idx)]
+
+
+# ---------------------------------------------------------------------------
+# Synthetic ZebraLogic grids — format exposure for AE training
+# ---------------------------------------------------------------------------
+
+# Value pools for synthetic grids — modelled on ZebraLogic's categories so the
+# surface form (tokens + structure) matches, while the *assignments* are random
+# and therefore share no puzzle with the eval set.
+_ZEBRA_SYNTH_POOLS = {
+    "Name": ["Peter", "Alice", "Bob", "Eric", "Arnold", "Carol", "Samuel", "Diana"],
+    "Nationality": ["norwegian", "german", "dane", "brit", "swede", "mexican", "chinese", "french"],
+    "BookGenre": ["mystery", "science fiction", "romance", "fantasy", "biography", "poetry", "history", "thriller"],
+    "Food": ["pizza", "grilled cheese", "spaghetti", "stew", "soup", "stir fry", "tacos", "sushi"],
+    "Color": ["red", "green", "blue", "yellow", "white", "purple", "brown", "orange"],
+    "Animal": ["dog", "cat", "bird", "fish", "horse", "rabbit", "zebra", "cow"],
+    "Drink": ["water", "tea", "coffee", "milk", "juice", "wine", "beer", "soda"],
+    "Hobby": ["painting", "cooking", "gardening", "photography", "cycling", "knitting", "fishing", "chess"],
+}
+
+
+class SyntheticZebraGridDataset(Dataset):
+    """Random ZebraLogic-style solution grids for AE format exposure.
+
+    Contamination-free by construction (random assignments over generic value
+    pools — never the eval puzzles), so it can be mixed into AE training without
+    touching the anchoring property. Only the **answer** serialization is
+    produced (there are no clues); its sole job is to teach the frozen-BART AE
+    the grid surface form.
+    """
+
+    def __init__(
+        self,
+        max_samples: int = 50_000,
+        min_size: int = 2,
+        max_size: int = 6,
+        min_attrs: int = 2,
+        max_attrs: int = 6,
+        seed: int = 0,
+    ):
+        rng = random.Random(seed)
+        cats = list(_ZEBRA_SYNTH_POOLS.keys())
+        max_attrs = min(max_attrs, len(cats))
+        self.examples: list[dict] = []
+        for _ in range(max_samples):
+            n = rng.randint(min_size, max_size)
+            a = rng.randint(min_attrs, max_attrs)
+            chosen = rng.sample(cats, a)
+            colvals = {c: rng.sample(_ZEBRA_SYNTH_POOLS[c], n) for c in chosen}
+            rows = [[str(i + 1)] + [colvals[c][i] for c in chosen] for i in range(n)]
+            sol = {"header": ["House"] + chosen, "rows": rows}
+            self.examples.append({
+                "question": "",
+                "answer": serialize_zebra_solution(sol),
+                "_solution": sol,
+            })
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        return self.examples[int(idx)]
+
+
+# ---------------------------------------------------------------------------
+# Synthetic ZebraLogic puzzles WITH clues — the EBM solver-training corpus
+# ---------------------------------------------------------------------------
+
+class ClueZebraGridDataset(Dataset):
+    """Full logic-grid puzzles (NL clues + unique solution) for EBM training.
+
+    `WildEval/ZebraLogic` ships only a 1000-puzzle *test* split — no training
+    corpus — and `SyntheticZebraGridDataset` has no clues, so neither can train a
+    solver. This dataset closes that gap: it samples a random solution grid (over
+    generic value pools, so it is eval-disjoint by construction, like
+    `SyntheticZebraGridDataset`) and runs the vendored `generate_puzzle`
+    (`ired/puzzle_gen.py`) to obtain a minimal, uniqueness-verified clue set,
+    rendered to ZebraLogic-style **prose** (gensis §5.5).
+
+    Because the clues come from a *different* generator than the WildEval eval,
+    generator→WildEval transfer measures solving rather than generator-fitting
+    (the §7 protocol). Record fields match `ZebraLogicDataset`:
+      - `question`  = prose clue block (EBM conditioning).
+      - `answer`    = serialized gold grid (the AE round-trips this).
+      - `_solution` = {header, rows} dict for the exact-match verifier.
+      - `_size`     = number of houses (for size-holdout eval).
+
+    Generation is slow (clue minimization is ~tens of ms/puzzle), so the
+    materialized corpus is cached to disk keyed by every generation parameter
+    (and the value pools); a second run with the same config loads instantly.
+    Cache lives under `cache_dir` (default `~/.cache/ired-reasoning/clue_zebra`);
+    pass `use_cache=False` to disable.
+    """
+
+    _CACHE_FIELDS = (
+        "max_samples", "min_size", "max_size", "min_attrs", "max_attrs",
+        "min_level", "max_level", "minimal_conditions",
+        "max_seconds_for_minimizing", "prose", "seed",
+    )
+
+    def __init__(
+        self,
+        max_samples: int = 20_000,
+        min_size: int = 2,
+        max_size: int = 4,
+        min_attrs: int = 3,
+        max_attrs: int = 5,
+        min_level: int = 5,
+        max_level: int = 8,
+        minimal_conditions: bool = True,
+        max_seconds_for_minimizing: float = 2.0,
+        prose: bool = True,
+        seed: int = 0,
+        cache_dir: str | None = None,
+        use_cache: bool = True,
+    ):
+        from .puzzle_gen import generate_puzzle, render_premises
+
+        cats = list(_ZEBRA_SYNTH_POOLS.keys())
+        max_attrs = min(max_attrs, len(cats))
+        self.examples: list[dict] = []
+
+        # --- disk cache lookup -------------------------------------------------
+        params = {f: locals()[f] for f in self._CACHE_FIELDS}
+        cpath = None
+        if use_cache:
+            cdir = cache_dir if cache_dir is not None else os.path.join(
+                os.path.expanduser("~"), ".cache", "ired-reasoning", "clue_zebra")
+            payload = json.dumps([params, _ZEBRA_SYNTH_POOLS], sort_keys=True)
+            digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+            cpath = os.path.join(cdir, f"clue_{digest}.json")
+            if os.path.exists(cpath):
+                try:
+                    with open(cpath) as f:
+                        self.examples = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    self.examples = []           # corrupt cache → regenerate
+            if self.examples:
+                return
+
+        # --- generate ----------------------------------------------------------
+        rng = random.Random(seed)
+        random.seed(seed)                       # generate_puzzle uses global RNG
+        attempts = 0
+        while len(self.examples) < max_samples and attempts < max_samples * 4:
+            attempts += 1
+            n = rng.randint(min_size, max_size)
+            a = rng.randint(min_attrs, min(max_attrs, len(cats)))
+            level = rng.randint(min_level, max_level)
+            chosen = rng.sample(cats, a)
+            # rows = attributes, cols = houses (the generator's table layout)
+            table = [[c] + rng.sample(_ZEBRA_SYNTH_POOLS[c], n) for c in chosen]
+            try:
+                premises = generate_puzzle(
+                    table, level=level,
+                    minimal_conditions=minimal_conditions,
+                    max_seconds_for_minimizing=max_seconds_for_minimizing,
+                )
+            except ValueError:
+                continue                        # size/level combo rejected upstream
+            if not premises:
+                continue
+            question = render_premises(premises, prose=prose)
+            # transpose attribute-major table → house-major solution grid
+            sol = {
+                "header": ["House"] + chosen,
+                "rows": [
+                    [str(p + 1)] + [table[i][p + 1] for i in range(len(table))]
+                    for p in range(n)
+                ],
+            }
+            self.examples.append({
+                "question": question,
+                "answer": serialize_zebra_solution(sol),
+                "_solution": sol,
+                "_size": n,
+            })
+
+        # --- persist cache (best-effort, atomic) -------------------------------
+        if cpath:
+            try:
+                os.makedirs(os.path.dirname(cpath), exist_ok=True)
+                tmp = f"{cpath}.tmp{os.getpid()}"
+                with open(tmp, "w") as f:
+                    json.dump(self.examples, f)
+                os.replace(tmp, cpath)
+            except OSError:
+                pass                            # caching is best-effort
 
     def __len__(self):
         return len(self.examples)

@@ -47,14 +47,6 @@ def extract(a: torch.Tensor, t: torch.Tensor, x_shape: Sequence[int]) -> torch.T
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
-def linear_beta_schedule(timesteps: int) -> torch.Tensor:
-    # IRED's formula assumes timesteps ~1000. For small T the upper end exceeds 1.0,
-    # which makes alpha negative and sqrt(alpha_cumprod) NaN for late t. Clip to the
-    # same upper bound as the cosine schedule so q_sample is always well-defined.
-    scale = 1000.0 / timesteps
-    return torch.linspace(scale * 1e-4, scale * 0.02, timesteps, dtype=torch.float64).clamp(max=0.999)
-
-
 def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps, dtype=torch.float64)
@@ -70,7 +62,7 @@ class GaussianLatentDiffusion(nn.Module):
         model: nn.Module,                  # DiffusionWrapper around the EBM
         latent_shape: Sequence[int],       # (K, d_model)
         timesteps: int = 10,
-        beta_schedule: str = "linear",
+        beta_schedule: str = "cosine",
         opt_step_size: float = 1.0,
         loss_scale: float = 1.0,           # weight on NCE term
         continuous: bool = True,           # matches the matrix-addition variant
@@ -160,12 +152,11 @@ class GaussianLatentDiffusion(nn.Module):
         self._decoder_loss_fn: DecoderLossFn | None = None
         self._gen_ce_fn: GenCEFn | None = None
 
-        if beta_schedule == "linear":
-            betas = linear_beta_schedule(timesteps)
-        elif beta_schedule == "cosine":
-            betas = cosine_beta_schedule(timesteps)
-        else:
-            raise ValueError(beta_schedule)
+        if beta_schedule != "cosine":
+            raise ValueError(
+                f"beta_schedule must be 'cosine' (linear was removed), got {beta_schedule!r}"
+            )
+        betas = cosine_beta_schedule(timesteps)
 
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)

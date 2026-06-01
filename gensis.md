@@ -634,6 +634,56 @@ has only `E` at deployment; if Milestone 2 finds the `E`–correctness correlati
 low, the honest read (§8) is that the calibration bet failed — not that `E` was
 only ever a search direction.
 
+### 5.5 The verifier grades the assignment, not the bytes
+
+The frozen-anchor AE reconstructs ZebraLogic *content* well (values come back
+right) but corrupts the **serialization scaffolding** — stray quotes/slashes,
+spaces around `=`, a mangled delimiter or attribute key (`Name="Arnold`,
+`Food=/soup`, `Cigarc=blends`, `Drink =water`). Under a byte-literal parse every
+one of those fails a puzzle that the latent actually solved. The fix is to grade
+the **closed-vocabulary assignment** rather than the literal string: snap each
+decoded attribute key to the puzzle's known header set and each value to that
+attribute's known candidate set (nearest normalized edit distance), then apply
+the §7 cell-exact check to the snapped grid. This is sound here because the
+ZebraLogic answer alphabet is *given by the puzzle* and finite — the same fact
+that makes the puzzle uniquely solvable — so snapping is the **external verifier**
+of §2.3/§5.4, made robust to transduction noise, not a new anchor.
+
+This does not relax the NL commitment, because of where that commitment actually
+sits. §1.2(3) puts the load-bearing language on (a) the *problem* — the clues are
+irreducibly natural-language prose (§8), the EBM's conditioning — and (b) the
+**decoder transduces, it does not reason**. Snapping touches neither: it is a
+verifier-side operation strictly downstream of the once-rendered surface form, so
+the decoder still renders from the latent alone and cognition stays in the latent
+optimization. genesis never committed to NL *output* — the answer surface was
+*deliberately* engineered low-entropy / common-noun / fixed-format (the whole
+ZebraLogic rationale, §7) so the language AE could carry it; the byte-exact
+requirement of §3 was argued for *code*, where whitespace is load-bearing syntax,
+and is moot for a grid whose information content is the assignment alone.
+
+The one guardrail is §5.2: snapping must never launder a reasoning error. It does
+not, because of an asymmetry the snap exploits rather than blurs. **Transduction
+corruption produces off-vocabulary tokens** (`/soup`, `"arnold`) → nearest-legal
+repairs them. **A reasoning error produces a valid-but-wrong legal value** — the
+§5.2 single-attribute swap puts one legal value in the wrong house; both are in
+the candidate set, so nearest-legal maps each to *itself* and the cell-exact check
+still fails. This holds only if snapping is (i) per-attribute (snap to *that*
+attribute's candidates, not a global pool) and (ii) margin-guarded (a token
+genuinely between two legal values is left unsnapped, so an ambiguous near-miss
+fails rather than rounds to gold). Corruption is off-manifold; errors are
+on-manifold-but-wrong — snap forgives the first and cannot hide the second, so it
+*sharpens* §5.2 rather than eroding it.
+
+Honest scope: this is a **domain luxury** in the precise §5.4 sense — legitimate
+because ZebraLogic has a closed, verifiable answer alphabet, not a general cure
+for a lossy language AE. It measures *assignment* fidelity, not *surface*
+fidelity, so it must not be read as evidence that the AE is a faithful NL
+byte-channel; on a target where the surface form *is* the answer (the original
+code goal) the trick buys nothing and the lossiness would be a real defect. For
+ZebraLogic, surface fidelity was never the point — and snapping keeps the
+Milestone 1 AE gate and the Milestone 2 EBM eval on the *same* `zebra_match`,
+which is what the AE gate is supposed to predict.
+
 ---
 
 ## 6. Prior work in this exact shape
@@ -740,10 +790,13 @@ ZebraLogic (12% on hard puzzles), so there is real reasoning headroom.
   `WildEval/ZebraLogic` (grid_mode, 1000 puzzles, 2×2–6×6, unique solutions). The
   `allenai/ZebraLogicBench` mirror ships solutions **redacted** (`___`) as a
   leaderboard guard; `WildEval/ZebraLogic` keeps the gold grid. **Training format
-  source:** The AE trains on pure OpenWebText — the grid surface form (fixed
-  `House n: …` structure with common-noun values) is close enough to OWT's
-  natural distribution that no synthetic format exposure is needed.
-- **AE pretraining corpus:** OpenWebText. The AE is **never** trained on
+  source:** `SyntheticZebraGridDataset` — random grids over generic value pools in
+  the *identical* serialization. Being random assignments, they share no puzzle
+  with the eval set, so contamination is ruled out by construction (§2.2
+  anchoring).
+- **AE pretraining corpus:** OpenWebText **50% + synthetic grids 50%**. Pure OWT
+  under-teaches the fixed `House n: …` surface; the synthetic slice supplies it
+  without ever showing the AE a real eval puzzle. The AE is **never** trained on
   `WildEval/ZebraLogic`, so the latent space is not shaped by the eval
   distribution.
 - **LatentEnc/LatentDec:** `facebook/bart-base` (d_model=768), encoder frozen,
@@ -760,7 +813,9 @@ ZebraLogic (12% on hard puzzles), so there is real reasoning headroom.
   equal (puzzle-level exact match; order-insensitive over attributes; unparseable
   or partially-correct = fail). Pure structural comparison against the shipped
   gold grid — no database lifecycle, unlike Spider; the solution is unique, so
-  all-or-nothing *is* the correctness metric.
+  all-or-nothing *is* the correctness metric. Cells are snapped to the puzzle's
+  known attribute/value alphabet before comparison so transduction noise on the
+  serialization scaffolding does not fail a solved puzzle (§5.5).
 
 Practical defaults that survived first-run debugging (the *why* for each lives in
 `docs/implementation_pitfalls.md`): `cosine` schedule; `weight_decay=0.01`

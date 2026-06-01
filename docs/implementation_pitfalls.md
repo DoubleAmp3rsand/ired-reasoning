@@ -40,6 +40,11 @@ at T=10 has β ≥ 0.999 for half its range, so the EBM only sees variance
 interpolations near t=0; it never gets useful gradient at intermediate noise
 levels.
 
+**Resolution:** the linear schedule (`linear_beta_schedule`) was **removed** —
+`cosine` is now the only schedule (`GaussianLatentDiffusion(beta_schedule=...)`
+accepts only `"cosine"`; anything else raises). This pitfall is kept as the
+record of *why*.
+
 ## 2. EBM head magnitude inflates unboundedly without weight decay
 
 IRED's reference setup uses an MLP energy net on small (~tens-of-dims) tabular

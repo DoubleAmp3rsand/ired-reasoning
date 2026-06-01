@@ -1,8 +1,8 @@
 # Autoencoder training config — conv pool + unfrozen decoder, ZebraLogic task
 #
-# Trains the AttentionPool + ReconstructionNet on OpenWebText and evaluates
-# round-trip reconstruction on held-out ZebraLogic puzzles by puzzle-level
-# exact match.
+# Trains the AttentionPool + ReconstructionNet on OpenWebText + synthetic
+# logic-grid solutions (50/50 mix), and evaluates round-trip reconstruction on
+# held-out ZebraLogic puzzles by puzzle-level exact match.
 #
 # Why ZebraLogic: the AE round-trip is the binding ceiling for any
 # execution-graded structured target. ZebraLogic keeps an irreducibly
@@ -39,15 +39,20 @@ owt_min_chars: 200
 owt_max_chars: 4000
 owt_eval_samples: 256
 
+zebra_mix_ratio: 0.5         # fraction synthetic logic-grid solutions; rest OWT
+zebra_samples: 50000         # synthetic grids to materialize (random, eval-disjoint)
+
+mixed_length: 200000         # virtual length of mixed OWT+grids dataset
+
 # ── Optimization ───────────────────────────────────────────────────────
-batch_size: 64
+batch_size: 96
 grad_accum_steps: 1          # effective batch = batch_size × this
 lr: 1.0e-4
 weight_decay: 0.01
 warmup_steps: 500
 min_lr_ratio: 0.1            # cosine floor as fraction of lr
 
-steps: 20000                 # total optimizer steps
+steps: 5000                  # total optimizer steps
 log_every: 50                # steps between log lines
 eval_every: 1000             # steps between eval cycles
 
@@ -61,7 +66,7 @@ zebra_max_size: 6            # largest puzzle (houses) to keep in eval
 num_workers: 4
 seed: 0
 device: cuda                 # cuda | cpu
-tui: true                    # Rich+plotext TUI (graphs + scrolling log)
+tui: false                    # Rich+plotext TUI (graphs + scrolling log)
 save_dir: checkpoints/ae_zebra_conv
 
 # ── HuggingFace Hub (optional) ─────────────────────────────────────────
